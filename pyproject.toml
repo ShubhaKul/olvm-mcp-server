@@ -3,6 +3,8 @@ name = "olvm-mcp"
 version = "0.1.0"
 description = "MCP server for Oracle Linux Virtualization Manager (OLVM) and oVirt"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     { name = "ShubhaKul", email = "shubha_kul@hotmail.com" }
 ]

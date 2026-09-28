@@ -1,5 +1,7 @@
 # olvm-mcp
 
+[![tests](https://github.com/ShubhaKul/olvm-mcp-server/actions/workflows/tests.yml/badge.svg)](https://github.com/ShubhaKul/olvm-mcp-server/actions/workflows/tests.yml)
+
 An [MCP](https://modelcontextprotocol.io) server for **Oracle Linux Virtualization Manager (OLVM)** and **oVirt**. It lets AI assistants such as Claude read your virtualization inventory through the engine's REST API.
 
 Tested against OLVM 4.5.5. This is Phase 1: **read-only**.
@@ -144,3 +146,7 @@ Logs go to stderr, because stdout carries the MCP protocol.
 - **Phase 2:** operator actions (start/stop, snapshots, migration, host maintenance) with dry-run, confirmation and an audit log
 - **Phase 3:** Streamable HTTP transport with authentication, for remote clients
 - **Phase 4:** agents built on top (triage, capacity reports, provisioning)
+
+## License
+
+[Apache License 2.0](LICENSE)
