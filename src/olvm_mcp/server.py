@@ -14,7 +14,15 @@ from mcp.types import ToolAnnotations
 
 from .client import OlvmClient, OlvmError, OlvmNotFound
 from .config import ConfigError, Settings
-from .formatting import detail_vm, summarize_host, summarize_vm
+from .formatting import (
+    detail_vm,
+    summarize_event,
+    summarize_host,
+    summarize_job,
+    summarize_snapshot,
+    summarize_storage_domain,
+    summarize_vm,
+)
 
 log = logging.getLogger("olvm_mcp")
 # httpx logs every request at INFO, which would echo engine URLs into client logs.
@@ -30,8 +38,9 @@ mcp = MCPServer(
     name="olvm",
     instructions=(
         "Read-only access to an Oracle Linux Virtualization Manager (OLVM) / oVirt engine. "
-        "Use list_vms and list_hosts to find objects (they accept oVirt search syntax), "
-        "then get_vm for details on one VM."
+        "Use list_vms, list_hosts and list_storage_domains to find objects (they accept oVirt "
+        "search syntax), then get_vm or list_snapshots for one VM. Use list_events to see what "
+        "happened recently, and get_job_status to follow long-running engine operations."
     ),
 )
 
@@ -141,6 +150,107 @@ def list_hosts(search: str = "", max_results: int = 50) -> dict[str, Any]:
         "count": len(hosts),
         "truncated": truncated,
         "hosts": [summarize_host(h, clusters) for h in hosts],
+    }
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_events(search: str = "", max_results: int = 50) -> dict[str, Any]:
+    """List engine events (audit log entries), newest first.
+
+    Args:
+        search: Optional oVirt search query, for example `severity>normal`
+            (warnings and errors only), `severity=error`, `vm.name=vm-test`, or
+            `host.name=kvm*`. Leave empty for all events, including routine ones.
+        max_results: Maximum number of events to return (1-200, default 50).
+    """
+    try:
+        events, truncated = _list("events", "event", search, max_results)
+        client = get_client()
+        clusters, hosts = client.names("clusters", "cluster"), client.names("hosts", "host")
+    except OlvmError as e:
+        raise ToolError(str(e)) from e
+    return {
+        "count": len(events),
+        "truncated": truncated,
+        "events": [summarize_event(e, clusters, hosts) for e in events],
+    }
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_snapshots(vm_name_or_id: str) -> dict[str, Any]:
+    """List the snapshots of one virtual machine.
+
+    Args:
+        vm_name_or_id: The VM's exact name, or its UUID.
+    """
+    client = get_client()
+    try:
+        vm = _resolve_vm(client, vm_name_or_id.strip())
+        snaps = client.list(f"vms/{vm['id']}/snapshots", "snapshot")
+    except OlvmError as e:
+        raise ToolError(str(e)) from e
+    # Every VM has an "active" snapshot that stands for its current state; it isn't a real snapshot.
+    snaps = [s for s in snaps if s.get("snapshot_type") != "active"]
+    return {
+        "vm": vm.get("name"),
+        "count": len(snaps),
+        "snapshots": [summarize_snapshot(s) for s in snaps],
+    }
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_storage_domains(search: str = "", max_results: int = 50) -> dict[str, Any]:
+    """List storage domains with their type, status, capacity and free space.
+
+    Args:
+        search: Optional oVirt search query, for example `type=data`,
+            `name=nfs*`, or `status=unattached`. Leave empty to list all.
+        max_results: Maximum number of storage domains to return (1-200, default 50).
+    """
+    try:
+        domains, truncated = _list("storagedomains", "storage_domain", search, max_results)
+    except OlvmError as e:
+        raise ToolError(str(e)) from e
+    return {
+        "count": len(domains),
+        "truncated": truncated,
+        "storage_domains": [summarize_storage_domain(sd) for sd in domains],
+    }
+
+
+@mcp.tool(annotations=READ_ONLY)
+def get_job_status(job_id: str = "", max_results: int = 20) -> dict[str, Any]:
+    """Get the status of an engine job, or list recent jobs.
+
+    Long-running operations (starting or migrating a VM, creating a snapshot)
+    run as engine jobs. The engine clears finished jobs after a while.
+
+    Args:
+        job_id: A job's UUID. Returns that job with its steps. Leave empty to
+            list recent jobs, newest first.
+        max_results: When listing, the maximum number of jobs (1-200, default 20).
+    """
+    client = get_client()
+    job_id = job_id.strip()
+    try:
+        if job_id:
+            if not _UUID.match(job_id):
+                raise ToolError(f"{job_id!r} is not a job id. Call get_job_status without a job_id to list jobs.")
+            try:
+                job = client.get(f"jobs/{job_id}")
+            except OlvmNotFound:
+                raise ToolError(f"No job with id {job_id}. The engine may have cleared it.") from None
+            return summarize_job(job, client.list(f"jobs/{job_id}/steps", "step"))
+
+        jobs = client.list("jobs", "job")
+    except OlvmError as e:
+        raise ToolError(str(e)) from e
+    jobs.sort(key=lambda j: int(j.get("start_time") or 0), reverse=True)
+    limit = _clamp(max_results)
+    return {
+        "count": min(len(jobs), limit),
+        "truncated": len(jobs) > limit,
+        "jobs": [summarize_job(j) for j in jobs[:limit]],
     }
 
 

@@ -13,6 +13,10 @@ Tested against OLVM 4.5.5. This is Phase 1: **read-only**.
 | `list_vms(search, max_results)` | VMs with status, cluster, host, CPUs, memory, OS |
 | `get_vm(name_or_id)` | One VM in detail, including disks and network interfaces |
 | `list_hosts(search, max_results)` | KVM hosts with status, cluster, CPU, memory, running VMs, OS and VDSM version |
+| `list_storage_domains(search, max_results)` | Storage domains with type, status, capacity, free space and a low-space flag |
+| `list_snapshots(vm_name_or_id)` | One VM's snapshots with date, status and whether memory was saved |
+| `list_events(search, max_results)` | Engine events (audit log), newest first, e.g. `severity=error` |
+| `get_job_status(job_id, max_results)` | One engine job with its steps, or recent jobs when no id is given |
 
 `search` accepts the engine's search syntax, for example `status=up`, `name=web*` or `cluster=Default and status=down`.
 

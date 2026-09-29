@@ -30,8 +30,13 @@ def main() -> None:
 
     show("list_hosts", server.list_hosts)
     show("list_vms", server.list_vms)
+    show("list_storage_domains", server.list_storage_domains)
+    show("list_events (latest 10)", server.list_events, "", 10)
+    show("list_events severity=error", server.list_events, "severity=error", 5)
+    show("get_job_status (recent jobs)", server.get_job_status)
     if len(sys.argv) > 1:
         show(f"get_vm {sys.argv[1]}", server.get_vm, sys.argv[1])
+        show(f"list_snapshots {sys.argv[1]}", server.list_snapshots, sys.argv[1])
 
 
 if __name__ == "__main__":

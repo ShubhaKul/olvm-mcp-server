@@ -6,10 +6,12 @@ The engine's JSON encodes most numbers and booleans as strings ("4294967296",
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
 GIB = 1024**3
+_SESSION = re.compile(r"using session '[^']*'")
 
 
 def _int(value: Any) -> int | None:
@@ -111,6 +113,80 @@ def _summarize_nic(nic: dict[str, Any]) -> dict[str, Any]:
         "plugged": _bool(nic.get("plugged")),
         "linked": _bool(nic.get("linked")),
     })
+
+
+def summarize_event(event: dict[str, Any], clusters: dict[str, str], hosts: dict[str, str]) -> dict[str, Any]:
+    description = event.get("description")
+    if description:
+        # Login events embed the engine session id; keep it out of the model's context.
+        description = _SESSION.sub("using session '<redacted>'", description)
+    return _drop_empty({
+        "id": event.get("id"),
+        "time": _timestamp(event.get("time")),
+        "severity": event.get("severity"),
+        "code": _int(event.get("code")),
+        "description": description,
+        "cluster": _ref_name(event, "cluster", clusters),
+        "host": _ref_name(event, "host", hosts),
+        "vm_id": (event.get("vm") or {}).get("id"),
+        "correlation_id": event.get("correlation_id"),
+    })
+
+
+def summarize_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
+    return _drop_empty({
+        "id": snap.get("id"),
+        "description": snap.get("description"),
+        "date": _timestamp(snap.get("date")),
+        "status": snap.get("snapshot_status"),
+        "type": snap.get("snapshot_type"),
+        "includes_memory": _bool(snap.get("persist_memorystate")),
+    })
+
+
+def summarize_storage_domain(sd: dict[str, Any]) -> dict[str, Any]:
+    available, used = _int(sd.get("available")), _int(sd.get("used"))
+    total = available + used if available is not None and used is not None else None
+    used_percent = round(100 * used / total, 1) if total else None
+    threshold = _int(sd.get("warning_low_space_indicator"))
+    return _drop_empty({
+        "id": sd.get("id"),
+        "name": sd.get("name"),
+        "type": sd.get("type"),
+        "storage_type": (sd.get("storage") or {}).get("type"),
+        "status": sd.get("status"),
+        "external_status": sd.get("external_status"),
+        "master": _bool(sd.get("master")),
+        "total_gib": _gib(total),
+        "used_gib": _gib(used),
+        "available_gib": _gib(available),
+        "used_percent": used_percent,
+        "committed_gib": _gib(sd.get("committed")),
+        # The engine warns when free space drops below this percentage.
+        "low_space": (100 - used_percent) < threshold if used_percent is not None and threshold else None,
+    })
+
+
+def summarize_job(job: dict[str, Any], steps: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    summary = _drop_empty({
+        "id": job.get("id"),
+        "description": job.get("description"),
+        "status": job.get("status"),
+        "started": _timestamp(job.get("start_time")),
+        "ended": _timestamp(job.get("end_time")),
+        "last_updated": _timestamp(job.get("last_updated")),
+    })
+    if steps is not None:
+        ordered = sorted(steps, key=lambda s: _int(s.get("number")) or 0)
+        summary["steps"] = [_drop_empty({
+            "description": s.get("description"),
+            "type": s.get("type"),
+            "status": s.get("status"),
+            "progress": _int(s.get("progress")),
+            "started": _timestamp(s.get("start_time")),
+            "ended": _timestamp(s.get("end_time")),
+        }) for s in ordered]
+    return summary
 
 
 def summarize_host(host: dict[str, Any], clusters: dict[str, str]) -> dict[str, Any]:
