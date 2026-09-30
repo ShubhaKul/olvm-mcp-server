@@ -86,13 +86,33 @@ class OlvmClient:
 
     # -- requests -----------------------------------------------------------
 
+    @property
+    def settings(self) -> Settings:
+        return self._settings
+
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """GET /api/<path> and return the decoded JSON body."""
+        return self._request("GET", path, params=params)
+
+    def post(self, path: str, body: dict[str, Any], correlation_id: str | None = None) -> dict[str, Any]:
+        """POST a JSON body to /api/<path> (an action or a new object) and return the response.
+
+        The correlation id is sent as the engine's Correlation-Id header, so the
+        engine's events and jobs for this request carry it.
+        """
+        headers = {"Correlation-Id": correlation_id} if correlation_id else None
+        return self._request("POST", path, json=body, headers=headers)
+
+    def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None,
+                 json: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:
         url = f"/api/{path.lstrip('/')}"
         for attempt in (1, 2):
             token = self._token or self._login()
+            # A 401 means the engine rejected the token before running anything,
+            # so retrying once is safe for POSTs too.
             try:
-                resp = self._http.get(url, params=params, headers={"Authorization": f"Bearer {token}"})
+                resp = self._http.request(method, url, params=params, json=json,
+                                          headers={**(headers or {}), "Authorization": f"Bearer {token}"})
             except httpx.TransportError as e:
                 raise self._transport_error(e) from e
             if resp.status_code == 401 and attempt == 1:
@@ -111,7 +131,9 @@ class OlvmClient:
         if resp.status_code >= 400 or not is_json:
             detail = ""
             if is_json:
-                fault = resp.json()
+                body = resp.json()
+                # Failed actions wrap the fault: {"status": "failed", "fault": {"detail": ...}}
+                fault = body.get("fault") or body
                 detail = fault.get("detail") or fault.get("reason") or ""
             elif "html" in content_type:
                 detail = (

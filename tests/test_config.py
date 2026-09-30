@@ -47,3 +47,31 @@ def test_verify_modes(tmp_path):
 
 def test_password_not_in_repr():
     assert "p'" not in repr(Settings.from_env(ENV))
+
+
+def test_read_only_is_the_default_mode():
+    assert Settings.from_env(ENV).mode == "read_only"
+
+
+def test_unknown_mode_rejected():
+    with pytest.raises(ConfigError, match="OLVM_MODE"):
+        Settings.from_env({**ENV, "OLVM_MODE": "admin"})
+
+
+def test_operator_mode_needs_a_cluster_allow_list():
+    with pytest.raises(ConfigError, match="OLVM_ALLOWED_CLUSTERS"):
+        Settings.from_env({**ENV, "OLVM_MODE": "operator"})
+
+
+def test_cluster_allow_list(tmp_path):
+    s = Settings.from_env({**ENV, "OLVM_MODE": "Operator", "OLVM_ALLOWED_CLUSTERS": " Default, lab ",
+                           "OLVM_AUDIT_LOG": str(tmp_path / "a.jsonl")})
+    assert s.mode == "operator" and s.allowed_clusters == ("Default", "lab")
+    assert s.cluster_allowed("default") and s.cluster_allowed("LAB")
+    assert not s.cluster_allowed("prod") and not s.cluster_allowed(None)
+    assert s.audit_log == tmp_path / "a.jsonl"
+
+
+def test_star_allows_every_cluster():
+    s = Settings.from_env({**ENV, "OLVM_MODE": "operator", "OLVM_ALLOWED_CLUSTERS": "*"})
+    assert s.cluster_allowed("anything")

@@ -13,7 +13,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from .client import OlvmClient, OlvmError, OlvmNotFound
-from .config import ConfigError, Settings
+from .config import OPERATOR, READ_ONLY, ConfigError, Settings, mode_from_env
 from .formatting import (
     detail_vm,
     summarize_event,
@@ -37,10 +37,13 @@ READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False,
 mcp = MCPServer(
     name="olvm",
     instructions=(
-        "Read-only access to an Oracle Linux Virtualization Manager (OLVM) / oVirt engine. "
+        "Access to an Oracle Linux Virtualization Manager (OLVM) / oVirt engine. "
         "Use list_vms, list_hosts and list_storage_domains to find objects (they accept oVirt "
         "search syntax), then get_vm or list_snapshots for one VM. Use list_events to see what "
-        "happened recently, and get_job_status to follow long-running engine operations."
+        "happened recently, and get_job_status to follow long-running engine operations. "
+        "In operator mode the server also offers start_vm, shutdown_vm and create_snapshot: "
+        "call them with dry_run=true first, show the user what would change, and only run the "
+        "action after the user confirms."
     ),
 )
 
@@ -258,6 +261,15 @@ def main() -> None:
     # stdout carries the MCP protocol; logs must go to stderr.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        mode = mode_from_env()
+    except ConfigError as e:
+        log.error("%s; write tools stay disabled", e)
+        mode = READ_ONLY
+    if mode == OPERATOR:
+        from . import actions  # imports this module, so load it only when needed
+        actions.register(mcp)
+        log.info("Operator mode: write tools enabled")
     mcp.run()
 
 

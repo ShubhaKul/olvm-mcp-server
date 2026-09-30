@@ -40,6 +40,38 @@ def test_expired_token_is_refreshed_once(client, engine):
     assert route.calls.last.request.headers["Authorization"] == "Bearer tok-2"
 
 
+def test_post_sends_json_and_correlation_id(client, engine):
+    route = engine.post("/api/vms/x/start").respond(200, json={"status": "complete"})
+    assert client.post("vms/x/start", {}, correlation_id="olvm-mcp-abc") == {"status": "complete"}
+    request = route.calls.last.request
+    assert request.headers["Correlation-Id"] == "olvm-mcp-abc"
+    assert request.headers["Content-Type"] == "application/json"
+    assert request.headers["Authorization"] == "Bearer tok-1"
+
+
+def test_failed_action_fault_detail_is_reported(client, engine):
+    # The shape OLVM 4.5 returns when the scheduler refuses to start a VM.
+    engine.post("/api/vms/x/start").respond(409, json={"status": "failed", "fault": {
+        "reason": "Operation Failed",
+        "detail": "[Cannot run VM. There is no host that satisfies current scheduling constraints.]"}})
+    with pytest.raises(OlvmError, match="HTTP 409.*no host that satisfies"):
+        client.post("vms/x/start", {})
+
+
+def test_post_retries_once_on_expired_token(client, engine):
+    engine.post("/sso/oauth/token").mock(side_effect=[
+        httpx.Response(200, json={"access_token": "tok-1"}),
+        httpx.Response(200, json={"access_token": "tok-2"}),
+    ])
+    route = engine.post("/api/vms/x/start").mock(side_effect=[
+        httpx.Response(401),
+        httpx.Response(200, json={}),
+    ])
+    client.post("vms/x/start", {})
+    assert route.call_count == 2
+    assert route.calls.last.request.headers["Authorization"] == "Bearer tok-2"
+
+
 def test_bad_credentials(client, engine):
     engine.post("/sso/oauth/token").respond(
         400, json={"error": "access_denied", "error_description": "Cannot authenticate user"})
