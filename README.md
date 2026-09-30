@@ -4,7 +4,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server for **Oracle Linux Virtualization Manager (OLVM)** and **oVirt**. It lets AI assistants such as Claude read your virtualization inventory through the engine's REST API.
 
-Tested against OLVM 4.5.5. This is Phase 1: **read-only**.
+Tested against OLVM 4.5.5. It is **read-only by default**. In [operator mode](#operator-mode-write-actions) it can also start and shut down VMs and take snapshots, behind dry-run, a cluster allow-list and an audit log.
 
 ## Tools
 
@@ -20,7 +20,15 @@ Tested against OLVM 4.5.5. This is Phase 1: **read-only**.
 
 `search` accepts the engine's search syntax, for example `status=up`, `name=web*` or `cluster=Default and status=down`.
 
-Every tool is marked read-only (`readOnlyHint`), and results are capped at 200 items.
+Every tool above is marked read-only (`readOnlyHint`), and results are capped at 200 items.
+
+In operator mode, three write tools are added:
+
+| Tool | What it does |
+|---|---|
+| `start_vm(vm_name_or_id, dry_run, wait, timeout_seconds)` | Powers on a VM and waits until it is up |
+| `shutdown_vm(vm_name_or_id, dry_run, wait, timeout_seconds)` | Graceful shutdown through the guest OS (not a power off), waits until down |
+| `create_snapshot(vm_name_or_id, description, include_memory, dry_run, wait, timeout_seconds)` | Snapshots a VM's disks, optionally with memory, and waits until it is ready |
 
 ## How it works
 
@@ -80,8 +88,53 @@ uv run python scripts/smoke_test.py vm-test
 | `OLVM_CA_FILE` | recommended | Engine CA certificate (PEM). Without it, the system trust store is used |
 | `OLVM_TIMEOUT` | no | Seconds per request (default 30) |
 | `OLVM_INSECURE` | no | `true` disables TLS verification. Lab use only |
+| `OLVM_MODE` | no | `read_only` (default) or `operator`, which adds the write tools |
+| `OLVM_ALLOWED_CLUSTERS` | in operator mode | Comma-separated cluster names that write tools may touch, or `*` for all |
+| `OLVM_AUDIT_LOG` | no | Audit log file (default `~/.olvm-mcp/audit.jsonl`) |
 
 See [.env.example](.env.example).
+
+## Operator mode (write actions)
+
+Set `OLVM_MODE=operator` and `OLVM_ALLOWED_CLUSTERS` to turn on `start_vm`, `shutdown_vm` and `create_snapshot`. Without them the write tools aren't registered at all.
+
+Every write tool:
+
+1. **Checks the mode and the cluster allow-list.** A VM in a cluster that isn't listed is refused, and the refusal is audited.
+2. **Supports `dry_run=true`**, which describes the change without making it. The server instructions tell the assistant to dry-run first and confirm with you.
+3. **Writes an audit record before it acts**, and refuses to run if the audit log can't be written. A second record holds the outcome.
+4. **Sends a correlation id** (`olvm-mcp-…`) as the engine's `Correlation-Id` header. The same id appears in the audit log and on the engine's events, so `list_events` can show what the engine did.
+5. **Waits for the result**: the VM reaching `up` or `down`, or the snapshot reaching `ok`. If that takes longer than `timeout_seconds`, the result is `pending` rather than an error.
+
+Asking to start a VM that is already up, or to shut down one that is already down, returns `no_change` without calling the engine.
+
+The audit log is JSON Lines, one object per line:
+
+```json
+{"time": "2026-09-30T10:15:02+00:00", "user": "admin@ovirt@internalsso", "action": "start_vm", "vm": "vm-test", "vm_id": "668ea110-…", "cluster": "Default", "correlation_id": "olvm-mcp-3f2a9c1b7d4e", "params": {}, "outcome": "requested"}
+{"time": "2026-09-30T10:15:41+00:00", "user": "admin@ovirt@internalsso", "action": "start_vm", "vm": "vm-test", "vm_id": "668ea110-…", "cluster": "Default", "correlation_id": "olvm-mcp-3f2a9c1b7d4e", "outcome": "done", "status": "up"}
+```
+
+Outcomes are `requested`, `done`, `pending`, `submitted`, `failed` and `denied`.
+
+**Which account to use.** Operator mode needs an engine user that can start, stop and snapshot VMs. A user with a role scoped to the allowed clusters (for example UserVmManager) keeps the engine as a second line of defence. With an admin account, the allow-list and the audit log are the only limits, so keep `OLVM_ALLOWED_CLUSTERS` narrow and use a password file.
+
+Run operator mode as a **separate** MCP server entry next to the read-only one, so you can turn write access on and off independently:
+
+```json
+"olvm-operator": {
+  "command": "uv",
+  "args": ["--directory", "C:\\path\\to\\olvm-mcp-server-repo", "run", "olvm-mcp"],
+  "env": {
+    "OLVM_URL": "https://<engine-fqdn>/ovirt-engine",
+    "OLVM_USERNAME": "admin@ovirt@internalsso",
+    "OLVM_PASSWORD_FILE": "C:\\path\\to\\admin.pw",
+    "OLVM_CA_FILE": "C:\\path\\to\\olvm-ca.pem",
+    "OLVM_MODE": "operator",
+    "OLVM_ALLOWED_CLUSTERS": "Default"
+  }
+}
+```
 
 ## Connect an MCP client
 
@@ -139,6 +192,8 @@ src/olvm_mcp/
   client.py      REST client: SSO login, token refresh, errors
   formatting.py  compact summaries of engine JSON
   server.py      MCP server and tools
+  safety.py      audit log and correlation ids for write actions
+  actions.py     write tools, registered only in operator mode
 tests/           unit tests against a mocked engine (respx)
 scripts/         smoke test against a real engine
 ```
@@ -147,7 +202,7 @@ Logs go to stderr, because stdout carries the MCP protocol.
 
 ## Roadmap
 
-- **Phase 2:** operator actions (start/stop, snapshots, migration, host maintenance) with dry-run, confirmation and an audit log
+- **Phase 2:** operator actions with dry-run, confirmation and an audit log. Done so far: modes, cluster allow-list, audit log, `start_vm`, `shutdown_vm`, `create_snapshot`. Next: migration, host maintenance, and destructive actions (power off, remove, restore) behind confirmation tokens
 - **Phase 3:** Streamable HTTP transport with authentication, for remote clients
 - **Phase 4:** agents built on top (triage, capacity reports, provisioning)
 
