@@ -203,11 +203,13 @@ def test_register_adds_write_tools_with_annotations():
     mcp = MCPServer(name="t")
     actions.register(mcp)
     tools = {t.name: t.annotations for t in asyncio.run(mcp.list_tools())}
-    assert set(tools) == {"start_vm", "shutdown_vm", "create_snapshot", "migrate_vm"}
+    assert set(tools) == {"start_vm", "shutdown_vm", "create_snapshot", "migrate_vm",
+                          "set_host_maintenance"}
     assert all(a.read_only_hint is False for a in tools.values())
     assert tools["shutdown_vm"].destructive_hint is True
     assert tools["create_snapshot"].idempotent_hint is False
     assert tools["migrate_vm"].destructive_hint is False
+    assert tools["set_host_maintenance"].destructive_hint is True
 
 
 @pytest.mark.parametrize("mode, expected", [("operator", True), ("", False), ("bogus", False)])
@@ -335,3 +337,132 @@ def test_migrate_dry_run_warns_when_target_lacks_memory(operator, engine):
     two_hosts(engine, H1, {**H2, "max_scheduling_memory": str(1024**3)})
     result = actions.migrate_vm("vm-test", target_host="h2", dry_run=True)
     assert "probably refuse" in result["warnings"][0]
+
+
+# -- set_host_maintenance ---------------------------------------------------
+
+SPM_H1 = {**H1, "spm": {"status": "spm"}}
+
+
+def host_states(engine, host_id, *states):
+    """Successive GETs of the host return these statuses."""
+    base = {"h1": SPM_H1, "h2": H2}[host_id]
+    engine.get(f"/api/hosts/{host_id}").mock(side_effect=[
+        httpx.Response(200, json={**base, "status": s}) for s in states])
+
+
+def vms_on(engine, *vms):
+    engine.get("/api/vms").respond(200, json={"vm": list(vms)})
+
+
+def test_maintenance_dry_run_lists_vms_and_spm(operator, engine, audit_path):
+    two_hosts(engine, SPM_H1, H2)
+    vms_on(engine, VM_UP, VM_DOWN)  # VM_UP runs on h1; VM_DOWN has no host
+    deactivate = engine.post("/api/hosts/h1/deactivate")
+    result = actions.set_host_maintenance("kvm01.example.test", dry_run=True)
+    assert result["result"] == "would_run" and result["host"] == "kvm01.example.test"
+    assert result["host_id"] == "h1" and result["cluster"] == "Default"
+    assert result["vms_to_migrate"] == ["vm-test"]
+    assert "to kvm02.example.test: vm-test" in result["message"]
+    assert "SPM" in result["warnings"][0]
+    assert not deactivate.called and not audit_path.exists()
+
+
+def test_maintenance_waits_until_host_is_in_maintenance(operator, engine, audit_path):
+    two_hosts(engine, SPM_H1, H2)
+    vms_on(engine, VM_UP)
+    deactivate = engine.post("/api/hosts/h1/deactivate").respond(200, json={"status": "complete"})
+    host_states(engine, "h1", "preparing_for_maintenance", "maintenance")
+    result = actions.set_host_maintenance("10.0.0.141")
+    assert result["result"] == "done" and result["status"] == "maintenance"
+    assert result["vms_on_host"] == ["vm-test"]
+    assert deactivate.calls.last.request.headers["Correlation-Id"] == result["correlation_id"]
+    requested, done = audit_records(audit_path)
+    assert requested["host"] == "kvm01.example.test" and "vm" not in requested
+    assert requested["params"] == {"maintenance": True, "vms_to_migrate": ["vm-test"]}
+    assert done["outcome"] == "done" and done["status"] == "maintenance"
+
+
+def test_maintenance_that_falls_back_to_up_is_a_failure(operator, engine):
+    two_hosts(engine, SPM_H1, H2)
+    vms_on(engine, VM_UP)
+    engine.post("/api/hosts/h1/deactivate").respond(200, json={})
+    host_states(engine, "h1", "preparing_for_maintenance", "up")
+    result = actions.set_host_maintenance("h1")
+    assert result["result"] == "failed" and "list_events" in result["message"]
+
+
+def test_maintenance_still_preparing_is_pending(operator, engine):
+    two_hosts(engine, SPM_H1, H2)
+    vms_on(engine)
+    engine.post("/api/hosts/h1/deactivate").respond(200, json={})
+    host_states(engine, "h1", "preparing_for_maintenance")
+    result = actions.set_host_maintenance("h1", timeout_seconds=0)
+    assert result["result"] == "pending" and "take a while" in result["message"]
+
+
+def test_maintenance_refused_when_vms_have_nowhere_to_go(operator, engine):
+    two_hosts(engine, SPM_H1, {**H2, "status": "maintenance"})
+    vms_on(engine, VM_UP)
+    deactivate = engine.post("/api/hosts/h1/deactivate")
+    with pytest.raises(ToolError, match="no other host in cluster Default is up"):
+        actions.set_host_maintenance("h1")
+    assert not deactivate.called
+
+
+def test_maintenance_of_last_idle_host_warns_about_storage(operator, engine):
+    two_hosts(engine, SPM_H1, {**H2, "status": "maintenance"})
+    vms_on(engine)
+    result = actions.set_host_maintenance("h1", dry_run=True)
+    assert result["vms_to_migrate"] == [] and "No VMs run on it" in result["message"]
+    assert any("storage domains may become inactive" in w for w in result["warnings"])
+
+
+def test_maintenance_on_host_already_in_maintenance_is_no_change(operator, engine):
+    two_hosts(engine, SPM_H1, {**H2, "status": "maintenance"})
+    result = actions.set_host_maintenance("h2")
+    assert result["result"] == "no_change"
+
+
+def test_maintenance_needs_an_up_host(operator, engine):
+    two_hosts(engine, SPM_H1, {**H2, "status": "non_responsive"})
+    with pytest.raises(ToolError, match="non_responsive"):
+        actions.set_host_maintenance("h2")
+
+
+def test_activate_host_from_maintenance(operator, engine, audit_path):
+    two_hosts(engine, SPM_H1, {**H2, "status": "maintenance"})
+    activate = engine.post("/api/hosts/h2/activate").respond(200, json={})
+    host_states(engine, "h2", "activating", "up")
+    result = actions.set_host_maintenance("kvm02.example.test", maintenance=False)
+    assert result["result"] == "done" and result["status"] == "up"
+    assert activate.called
+    assert audit_records(audit_path)[0]["params"] == {"maintenance": False}
+
+
+def test_activate_that_ends_non_operational_is_a_failure(operator, engine):
+    two_hosts(engine, SPM_H1, {**H2, "status": "maintenance"})
+    engine.post("/api/hosts/h2/activate").respond(200, json={})
+    host_states(engine, "h2", "activating", "non_operational")
+    assert actions.set_host_maintenance("h2", maintenance=False)["result"] == "failed"
+
+
+def test_activate_up_host_is_no_change(operator, engine):
+    two_hosts(engine)
+    assert actions.set_host_maintenance("h2", maintenance=False)["result"] == "no_change"
+
+
+def test_host_outside_allow_list_is_refused_and_audited(operator, engine, audit_path, monkeypatch):
+    monkeypatch.setattr(operator, "_settings", replace(operator.settings, allowed_clusters=("Prod",)))
+    two_hosts(engine)
+    deactivate = engine.post("/api/hosts/h1/deactivate")
+    with pytest.raises(ToolError, match="Refusing to touch host 'kvm01.example.test'"):
+        actions.set_host_maintenance("h1")
+    assert not deactivate.called
+    [record] = audit_records(audit_path)
+    assert record["outcome"] == "denied" and record["host"] == "kvm01.example.test"
+
+
+def test_host_maintenance_refused_in_read_only_mode(tool_client, engine):
+    with pytest.raises(ToolError, match="read_only mode"):
+        actions.set_host_maintenance("h1")

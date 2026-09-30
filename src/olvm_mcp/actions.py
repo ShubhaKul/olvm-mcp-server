@@ -1,11 +1,11 @@
-"""Write actions: start, graceful shutdown, snapshots and live migration of virtual machines.
+"""Write actions: VM start, graceful shutdown, snapshots and live migration, and host maintenance.
 
 These tools are registered only when OLVM_MODE=operator. Every call:
-1. resolves the VM and checks the mode and OLVM_ALLOWED_CLUSTERS,
+1. resolves the VM or host and checks the mode and OLVM_ALLOWED_CLUSTERS,
 2. with dry_run=True, describes what it would do and stops there,
 3. writes a "requested" audit record, and refuses to run if it can't,
 4. sends the request with a correlation id, which the engine's events carry,
-5. optionally waits for the VM or snapshot to reach the expected state,
+5. optionally waits for the VM, snapshot or host to reach the expected state,
 6. writes an audit record with the outcome.
 """
 
@@ -39,6 +39,9 @@ SNAPSHOT = ToolAnnotations(read_only_hint=False, destructive_hint=False,
 # Live migration keeps the VM running, but moves load between hosts.
 MIGRATE = ToolAnnotations(read_only_hint=False, destructive_hint=False,
                           idempotent_hint=False, open_world_hint=False)
+# Maintenance deletes nothing, but it moves every VM off the host and takes it out of service.
+MAINTENANCE = ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                              idempotent_hint=True, open_world_hint=False)
 
 # Waits take (engine response) and return (result, extra fields for the tool output).
 Wait = Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]
@@ -46,48 +49,60 @@ Wait = Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]
 
 @dataclass
 class _Target:
+    """The VM or host a write action is about."""
     client: OlvmClient
     audit: AuditLog
-    vm: dict[str, Any]
+    obj: dict[str, Any]
     cluster: str | None
+    kind: str = "vm"  # "vm" or "host"; also the audit field names ("vm", "vm_id")
 
     @property
     def id(self) -> str:
-        return self.vm["id"]
+        return self.obj["id"]
 
     @property
     def name(self) -> str:
-        return self.vm.get("name", self.vm["id"])
+        return self.obj.get("name", self.obj["id"])
 
     @property
     def status(self) -> str | None:
-        return self.vm.get("status")
+        return self.obj.get("status")
 
     def describe(self, action: str) -> dict[str, Any]:
-        return {"action": action, "vm": self.name, "vm_id": self.id, "cluster": self.cluster}
+        return {"action": action, self.kind: self.name, f"{self.kind}_id": self.id, "cluster": self.cluster}
+
+
+def _operator_client() -> OlvmClient:
+    client = get_client()
+    if client.settings.mode != OPERATOR:
+        raise ToolError("Write actions are disabled because the server is in read_only mode. "
+                        "Set OLVM_MODE=operator to enable them.")
+    return client
+
+
+def _allowed(target: _Target, action: str) -> _Target:
+    """Refuse, and audit the refusal, when the target's cluster isn't allowed."""
+    settings = target.client.settings
+    if not settings.cluster_allowed(target.cluster):
+        detail = f"cluster {target.cluster!r} is not in OLVM_ALLOWED_CLUSTERS"
+        _audit_or_fail(target, **target.describe(action), outcome="denied", detail=detail)
+        label = "VM" if target.kind == "vm" else "host"
+        raise ToolError(f"Refusing to touch {label} {target.name!r}: {detail} "
+                        f"({', '.join(settings.allowed_clusters)}).")
+    return target
 
 
 def _target(action: str, vm_name_or_id: str) -> _Target:
     """Resolve the VM and enforce the mode and the cluster allow-list."""
-    client = get_client()
+    client = _operator_client()
     settings = client.settings
-    if settings.mode != OPERATOR:
-        raise ToolError("Write actions are disabled because the server is in read_only mode. "
-                        "Set OLVM_MODE=operator to enable them.")
     try:
         vm = _resolve_vm(client, vm_name_or_id.strip())
         clusters = client.names("clusters", "cluster")
     except OlvmError as e:
         raise ToolError(str(e)) from e
-    target = _Target(client, AuditLog(settings.audit_log, settings.username), vm,
-                     clusters.get((vm.get("cluster") or {}).get("id")))
-
-    if not settings.cluster_allowed(target.cluster):
-        detail = f"cluster {target.cluster!r} is not in OLVM_ALLOWED_CLUSTERS"
-        _audit_or_fail(target, **target.describe(action), outcome="denied", detail=detail)
-        raise ToolError(f"Refusing to touch VM {target.name!r}: {detail} "
-                        f"({', '.join(settings.allowed_clusters)}).")
-    return target
+    return _allowed(_Target(client, AuditLog(settings.audit_log, settings.username), vm,
+                            clusters.get((vm.get("cluster") or {}).get("id"))), action)
 
 
 def _audit_or_fail(target: _Target, **fields: Any) -> None:
@@ -366,9 +381,9 @@ def migrate_vm(vm_name_or_id: str, target_host: str = "", dry_run: bool = False,
     except OlvmError as e:
         raise ToolError(str(e)) from e
     host_names = {h["id"]: h.get("name", h["id"]) for h in hosts}
-    source_id = (target.vm.get("host") or {}).get("id")
+    source_id = (target.obj.get("host") or {}).get("id")
     source = host_names.get(source_id, source_id)
-    cluster_id = (target.vm.get("cluster") or {}).get("id")
+    cluster_id = (target.obj.get("cluster") or {}).get("id")
 
     dest: dict[str, Any] | None = None
     warnings: list[str] = []
@@ -382,7 +397,7 @@ def migrate_vm(vm_name_or_id: str, target_host: str = "", dry_run: bool = False,
         if dest.get("status") != "up":
             raise ToolError(f"Host {dest.get('name')} is {dest.get('status')}; it must be up.")
         free = _memory_gib(dest.get("max_scheduling_memory"))
-        needed = _memory_gib(target.vm.get("memory"))
+        needed = _memory_gib(target.obj.get("memory"))
         if free and needed > free:
             warnings.append(f"{dest.get('name')} can schedule {free:.1f} GiB but the VM has "
                             f"{needed:.1f} GiB; the engine will probably refuse.")
@@ -411,9 +426,135 @@ def migrate_vm(vm_name_or_id: str, target_host: str = "", dry_run: bool = False,
     return result
 
 
+# Host states from which activation or maintenance can't be expected to succeed.
+_HOST_FAILED = {"non_responsive", "non_operational", "error", "install_failed", "down", "kdumping"}
+
+
+def _wait_for_host_status(target: _Target, expected: str, transitional: str,
+                          timeout_seconds: int) -> Wait:
+    """Wait for the host to reach `expected`, passing through `transitional`.
+
+    Seeing the transitional state and then the starting state again means the
+    engine gave up, e.g. when it couldn't migrate every VM off the host.
+    """
+    start = target.status
+
+    def wait(_response: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        seen = False
+
+        def finished(host: dict[str, Any]) -> bool:
+            nonlocal seen
+            status = host.get("status")
+            seen = seen or status == transitional
+            return status == expected or status in _HOST_FAILED or (seen and status == start)
+
+        _, host = _poll(lambda: target.client.get(f"hosts/{target.id}"), finished,
+                        _clamp_wait(timeout_seconds))
+        status = host.get("status")
+        if status == expected:
+            return "done", {"status": status}
+        if status in _HOST_FAILED or (seen and status == start):
+            return "failed", {"status": status, "message": (
+                f"Host {target.name} is {status}, not {expected}. "
+                f"list_events with the correlation id shows why.")}
+        return "pending", {"status": status, "message": (
+            f"Host {target.name} is {status}, not {expected}, after {_clamp_wait(timeout_seconds)} "
+            f"seconds. Moving VMs off a host can take a while; check again with list_hosts.")}
+    return wait
+
+
+def set_host_maintenance(host_name_or_id: str, maintenance: bool = True, dry_run: bool = False,
+                         wait: bool = True, timeout_seconds: int = 900) -> dict[str, Any]:
+    """Put a KVM host into maintenance mode, or activate it again.
+
+    Entering maintenance makes the engine live-migrate every running VM to other
+    hosts in the cluster, and move the SPM role if this host holds it. Refused
+    when VMs are running and no other host in the cluster is up to take them.
+    Only available in operator mode, and only for hosts in OLVM_ALLOWED_CLUSTERS.
+    Every call that reaches the engine is written to the audit log.
+
+    Args:
+        host_name_or_id: The host's name, address or id.
+        maintenance: True to enter maintenance, False to activate the host again.
+        dry_run: Describe what would happen, including which VMs would move,
+            without changing anything. Use this first and confirm with the user.
+        wait: Wait until the host reaches maintenance (or up) before returning.
+        timeout_seconds: How long to wait (0-900, default 900). If the host
+            isn't there yet, the result is "pending", not an error.
+    """
+    action = "set_host_maintenance"
+    client = _operator_client()
+    settings = client.settings
+    try:
+        hosts = client.list("hosts", "host")
+        clusters = client.names("clusters", "cluster")
+    except OlvmError as e:
+        raise ToolError(str(e)) from e
+    host = _find_host(hosts, host_name_or_id)
+    cluster_id = (host.get("cluster") or {}).get("id")
+    target = _allowed(_Target(client, AuditLog(settings.audit_log, settings.username), host,
+                              clusters.get(cluster_id), kind="host"), action)
+
+    if not maintenance:
+        if target.status == "up":
+            return _no_change(target, action, f"Host {target.name} is already up.", dry_run)
+        if target.status not in ("maintenance", "non_operational"):
+            raise ToolError(f"Host {target.name} is {target.status}; only a host in maintenance "
+                            f"(or non-operational) can be activated.")
+        if dry_run:
+            return _dry_run(target, action, f"Would activate host {target.name} (now {target.status}) "
+                                            f"in cluster {target.cluster}, so it can run VMs again.")
+        return _execute(target, action, {"maintenance": False},
+                        lambda cid: client.post(f"hosts/{target.id}/activate", {}, cid),
+                        _wait_for_host_status(target, "up", "activating", timeout_seconds)
+                        if wait else None)
+
+    if target.status == "maintenance":
+        return _no_change(target, action, f"Host {target.name} is already in maintenance.", dry_run)
+    if target.status != "up":
+        raise ToolError(f"Host {target.name} is {target.status}; only a host that is up can be "
+                        f"put into maintenance this way.")
+
+    try:
+        running = [vm.get("name", vm["id"]) for vm in client.list("vms", "vm")
+                   if (vm.get("host") or {}).get("id") == target.id]
+    except OlvmError as e:
+        raise ToolError(str(e)) from e
+    others_up = [h.get("name", h["id"]) for h in hosts if h["id"] != target.id
+                 and h.get("status") == "up" and (h.get("cluster") or {}).get("id") == cluster_id]
+    if running and not others_up:
+        raise ToolError(f"{len(running)} VM(s) run on {target.name} ({', '.join(running)}) and no other "
+                        f"host in cluster {target.cluster} is up to take them. Shut them down or "
+                        f"bring another host up first.")
+
+    warnings = []
+    if (host.get("spm") or {}).get("status") == "spm":
+        warnings.append("This host is the SPM; the engine will hand the role to another host.")
+    if not others_up:
+        warnings.append(f"It is the only host that is up in cluster {target.cluster}; storage "
+                        f"domains may become inactive until a host is activated again.")
+
+    if dry_run:
+        moving = (f"The engine would live-migrate {len(running)} VM(s) to "
+                  f"{', '.join(others_up)}: {', '.join(running)}." if running else "No VMs run on it.")
+        extra: dict[str, Any] = {"vms_to_migrate": running}
+        if warnings:
+            extra["warnings"] = warnings
+        return _dry_run(target, action, f"Would put host {target.name} in cluster {target.cluster} "
+                                        f"into maintenance. {moving}", **extra)
+
+    result = _execute(target, action, {"maintenance": True, "vms_to_migrate": running},
+                      lambda cid: client.post(f"hosts/{target.id}/deactivate", {}, cid),
+                      _wait_for_host_status(target, "maintenance", "preparing_for_maintenance",
+                                            timeout_seconds) if wait else None)
+    result["vms_on_host"] = running
+    return result
+
+
 def register(mcp: MCPServer) -> None:
     """Add the write tools to the server. Called only in operator mode."""
     mcp.add_tool(start_vm, annotations=START)
     mcp.add_tool(shutdown_vm, annotations=SHUTDOWN)
     mcp.add_tool(create_snapshot, annotations=SNAPSHOT)
     mcp.add_tool(migrate_vm, annotations=MIGRATE)
+    mcp.add_tool(set_host_maintenance, annotations=MAINTENANCE)
