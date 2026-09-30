@@ -1,4 +1,4 @@
-"""Write actions: start, graceful shutdown and snapshots of virtual machines.
+"""Write actions: start, graceful shutdown, snapshots and live migration of virtual machines.
 
 These tools are registered only when OLVM_MODE=operator. Every call:
 1. resolves the VM and checks the mode and OLVM_ALLOWED_CLUSTERS,
@@ -36,6 +36,9 @@ SHUTDOWN = ToolAnnotations(read_only_hint=False, destructive_hint=True,
                            idempotent_hint=True, open_world_hint=False)
 SNAPSHOT = ToolAnnotations(read_only_hint=False, destructive_hint=False,
                            idempotent_hint=False, open_world_hint=False)
+# Live migration keeps the VM running, but moves load between hosts.
+MIGRATE = ToolAnnotations(read_only_hint=False, destructive_hint=False,
+                          idempotent_hint=False, open_world_hint=False)
 
 # Waits take (engine response) and return (result, extra fields for the tool output).
 Wait = Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]
@@ -279,8 +282,138 @@ def create_snapshot(vm_name_or_id: str, description: str, include_memory: bool =
                     wait_for_snapshot if wait else None)
 
 
+def _find_host(hosts: list[dict[str, Any]], name_or_id: str) -> dict[str, Any]:
+    """Match a host by id, name or address (the portal shows either as its label)."""
+    wanted = name_or_id.strip().lower()
+    matches = [h for h in hosts
+               if wanted in {str(h.get(k, "")).lower() for k in ("id", "name", "address")}]
+    if not matches:
+        known = ", ".join(sorted(h.get("name", h["id"]) for h in hosts))
+        raise ToolError(f"No host matches {name_or_id!r}. Hosts: {known}. Use list_hosts for details.")
+    if len(matches) > 1:
+        raise ToolError(f"More than one host matches {name_or_id!r}; use the host id.")
+    return matches[0]
+
+
+def _memory_gib(value: Any) -> float:
+    try:
+        return int(value) / 1024**3
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _wait_for_migration(target: _Target, source_id: str, dest_id: str | None,
+                        host_names: dict[str, str], timeout_seconds: int) -> Wait:
+    """Wait until the VM runs on another host, or the migration visibly ends without moving it."""
+    def wait(_response: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        seen_migrating = False
+
+        def finished(vm: dict[str, Any]) -> bool:
+            nonlocal seen_migrating
+            status = vm.get("status")
+            seen_migrating = seen_migrating or status == "migrating"
+            host_id = (vm.get("host") or {}).get("id")
+            moved = status == "up" and host_id not in (None, source_id)
+            # Back to "up" on the source after migrating means the engine gave up.
+            returned = seen_migrating and status == "up" and host_id == source_id
+            return moved or returned or status not in ("up", "migrating")
+
+        _, vm = _poll(lambda: target.client.get(f"vms/{target.id}"), finished,
+                      _clamp_wait(timeout_seconds))
+        status = vm.get("status")
+        host_id = (vm.get("host") or {}).get("id")
+        extra = {"status": status, "host": host_names.get(host_id, host_id)}
+        if status == "up" and host_id not in (None, source_id):
+            if dest_id and host_id != dest_id:
+                extra["message"] = f"VM moved, but to {extra['host']} rather than the requested host."
+            return "done", extra
+        if status == "up" and host_id == source_id and seen_migrating:
+            return "failed", {**extra, "message": (
+                "The migration ended and the VM is still on its original host. "
+                "list_events with the correlation id shows why.")}
+        if status not in ("up", "migrating"):
+            return "failed", {**extra, "message": f"VM is {status} after the migration request."}
+        return "pending", {**extra, "message": (
+            f"VM is {status} on {extra['host']} after {_clamp_wait(timeout_seconds)} seconds. "
+            f"Check again with get_vm, or list_events for the correlation id.")}
+    return wait
+
+
+def migrate_vm(vm_name_or_id: str, target_host: str = "", dry_run: bool = False,
+               wait: bool = True, timeout_seconds: int = 600) -> dict[str, Any]:
+    """Live-migrate a running virtual machine to another host in its cluster.
+
+    The VM keeps running while its memory is copied to the other host. Only
+    available in operator mode, and only for VMs in OLVM_ALLOWED_CLUSTERS.
+    Every call that reaches the engine is written to the audit log.
+
+    Args:
+        vm_name_or_id: The VM's exact name, or its UUID.
+        target_host: Host to move to, by name, address or id. Leave empty to
+            let the engine's scheduler choose a host.
+        dry_run: Describe what would happen without migrating. Use this first
+            and confirm with the user.
+        wait: Wait until the VM is running on the new host before returning.
+        timeout_seconds: How long to wait (0-900, default 600). If the move
+            hasn't finished by then, the result is "pending", not an error.
+    """
+    target = _target("migrate_vm", vm_name_or_id)
+    if target.status != "up":
+        raise ToolError(f"Only running VMs can be live-migrated; {target.name} is {target.status}.")
+
+    try:
+        hosts = target.client.list("hosts", "host")
+    except OlvmError as e:
+        raise ToolError(str(e)) from e
+    host_names = {h["id"]: h.get("name", h["id"]) for h in hosts}
+    source_id = (target.vm.get("host") or {}).get("id")
+    source = host_names.get(source_id, source_id)
+    cluster_id = (target.vm.get("cluster") or {}).get("id")
+
+    dest: dict[str, Any] | None = None
+    warnings: list[str] = []
+    if target_host.strip():
+        dest = _find_host(hosts, target_host)
+        if dest["id"] == source_id:
+            return _no_change(target, "migrate_vm", f"VM {target.name} already runs on {source}.", dry_run)
+        if (dest.get("cluster") or {}).get("id") != cluster_id:
+            raise ToolError(f"Host {dest.get('name')} is not in the VM's cluster {target.cluster}; "
+                            f"this tool only migrates within a cluster.")
+        if dest.get("status") != "up":
+            raise ToolError(f"Host {dest.get('name')} is {dest.get('status')}; it must be up.")
+        free = _memory_gib(dest.get("max_scheduling_memory"))
+        needed = _memory_gib(target.vm.get("memory"))
+        if free and needed > free:
+            warnings.append(f"{dest.get('name')} can schedule {free:.1f} GiB but the VM has "
+                            f"{needed:.1f} GiB; the engine will probably refuse.")
+    else:
+        others = [h for h in hosts if h["id"] != source_id and h.get("status") == "up"
+                  and (h.get("cluster") or {}).get("id") == cluster_id]
+        if not others:
+            raise ToolError(f"No other host in cluster {target.cluster} is up, so {target.name} "
+                            f"has nowhere to go.")
+
+    dest_label = dest.get("name") if dest else "a host chosen by the engine"
+    if dry_run:
+        extra: dict[str, Any] = {"from_host": source, "to_host": dest.get("name") if dest else None}
+        if warnings:
+            extra["warnings"] = warnings
+        return _dry_run(target, "migrate_vm",
+                        f"Would live-migrate VM {target.name} in cluster {target.cluster} from "
+                        f"{source} to {dest_label}. The VM keeps running during the move.", **extra)
+
+    body = {"host": {"id": dest["id"]}} if dest else {}
+    result = _execute(target, "migrate_vm", {"target_host": dest.get("name") if dest else None},
+                      lambda cid: target.client.post(f"vms/{target.id}/migrate", body, cid),
+                      _wait_for_migration(target, source_id, dest["id"] if dest else None,
+                                          host_names, timeout_seconds) if wait else None)
+    result["from_host"] = source
+    return result
+
+
 def register(mcp: MCPServer) -> None:
     """Add the write tools to the server. Called only in operator mode."""
     mcp.add_tool(start_vm, annotations=START)
     mcp.add_tool(shutdown_vm, annotations=SHUTDOWN)
     mcp.add_tool(create_snapshot, annotations=SNAPSHOT)
+    mcp.add_tool(migrate_vm, annotations=MIGRATE)

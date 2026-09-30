@@ -29,6 +29,7 @@ In operator mode, three write tools are added:
 | `start_vm(vm_name_or_id, dry_run, wait, timeout_seconds)` | Powers on a VM and waits until it is up |
 | `shutdown_vm(vm_name_or_id, dry_run, wait, timeout_seconds)` | Graceful shutdown through the guest OS (not a power off), waits until down |
 | `create_snapshot(vm_name_or_id, description, include_memory, dry_run, wait, timeout_seconds)` | Snapshots a VM's disks, optionally with memory, and waits until it is ready |
+| `migrate_vm(vm_name_or_id, target_host, dry_run, wait, timeout_seconds)` | Live-migrates a running VM to another host in its cluster (or one the engine picks) and waits until it runs there |
 
 ## How it works
 
@@ -96,7 +97,7 @@ See [.env.example](.env.example).
 
 ## Operator mode (write actions)
 
-Set `OLVM_MODE=operator` and `OLVM_ALLOWED_CLUSTERS` to turn on `start_vm`, `shutdown_vm` and `create_snapshot`. Without them the write tools aren't registered at all.
+Set `OLVM_MODE=operator` and `OLVM_ALLOWED_CLUSTERS` to turn on `start_vm`, `shutdown_vm`, `create_snapshot` and `migrate_vm`. Without them the write tools aren't registered at all.
 
 Every write tool:
 
@@ -202,7 +203,7 @@ Logs go to stderr, because stdout carries the MCP protocol.
 
 ## Roadmap
 
-- **Phase 2:** operator actions with dry-run, confirmation and an audit log. Done so far: modes, cluster allow-list, audit log, `start_vm`, `shutdown_vm`, `create_snapshot`. Next: migration, host maintenance, and destructive actions (power off, remove, restore) behind confirmation tokens
+- **Phase 2:** operator actions with dry-run, confirmation and an audit log. Done so far: modes, cluster allow-list, audit log, `start_vm`, `shutdown_vm`, `create_snapshot`, `migrate_vm`. Next: host maintenance, and destructive actions (power off, remove, restore) behind confirmation tokens
 - **Phase 3:** Streamable HTTP transport with authentication, for remote clients
 - **Phase 4:** agents built on top (triage, capacity reports, provisioning)
 

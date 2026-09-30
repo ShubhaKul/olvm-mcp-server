@@ -203,10 +203,11 @@ def test_register_adds_write_tools_with_annotations():
     mcp = MCPServer(name="t")
     actions.register(mcp)
     tools = {t.name: t.annotations for t in asyncio.run(mcp.list_tools())}
-    assert set(tools) == {"start_vm", "shutdown_vm", "create_snapshot"}
+    assert set(tools) == {"start_vm", "shutdown_vm", "create_snapshot", "migrate_vm"}
     assert all(a.read_only_hint is False for a in tools.values())
     assert tools["shutdown_vm"].destructive_hint is True
     assert tools["create_snapshot"].idempotent_hint is False
+    assert tools["migrate_vm"].destructive_hint is False
 
 
 @pytest.mark.parametrize("mode, expected", [("operator", True), ("", False), ("bogus", False)])
@@ -218,3 +219,119 @@ def test_main_registers_write_tools_only_in_operator_mode(monkeypatch, mode, exp
     server.main()
     names = {t.name for t in asyncio.run(fresh.list_tools())}
     assert ("start_vm" in names) is expected
+
+
+# -- migrate_vm -------------------------------------------------------------
+
+H1 = {"id": "h1", "name": "kvm01.example.test", "address": "10.0.0.141", "status": "up",
+      "cluster": {"id": "c1"}, "max_scheduling_memory": str(12 * 1024**3)}
+H2 = {"id": "h2", "name": "kvm02.example.test", "address": "10.0.0.149", "status": "up",
+      "cluster": {"id": "c1"}, "max_scheduling_memory": str(12 * 1024**3)}
+
+
+def two_hosts(engine, *hosts):
+    engine.get("/api/hosts").respond(200, json={"host": list(hosts or (H1, H2))})
+
+
+def vm_states(engine, *states):
+    """Successive GETs of the VM return these (status, host id) pairs."""
+    engine.get(f"/api/vms/{VM_ID}").mock(side_effect=[
+        httpx.Response(200, json={**VM_UP, "status": s, "host": {"id": h}}) for s, h in states])
+
+
+def test_migrate_dry_run_names_both_hosts(operator, engine, audit_path):
+    by_name(engine, VM_UP)
+    two_hosts(engine)
+    migrate = engine.post(f"/api/vms/{VM_ID}/migrate")
+    result = actions.migrate_vm("vm-test", target_host="10.0.0.149", dry_run=True)
+    assert result["result"] == "would_run"
+    assert result["from_host"] == "kvm01.example.test" and result["to_host"] == "kvm02.example.test"
+    assert "keeps running" in result["message"] and "warnings" not in result
+    assert not migrate.called and not audit_path.exists()
+
+
+def test_migrate_to_named_host_waits_until_it_runs_there(operator, engine, audit_path):
+    by_name(engine, VM_UP)
+    two_hosts(engine)
+    migrate = engine.post(f"/api/vms/{VM_ID}/migrate").respond(200, json={"status": "complete"})
+    vm_states(engine, ("up", "h1"), ("migrating", "h1"), ("up", "h2"))
+    result = actions.migrate_vm("vm-test", target_host="kvm02.example.test")
+    assert result["result"] == "done" and result["host"] == "kvm02.example.test"
+    assert result["from_host"] == "kvm01.example.test"
+    assert json.loads(migrate.calls.last.request.content) == {"host": {"id": "h2"}}
+    assert migrate.calls.last.request.headers["Correlation-Id"] == result["correlation_id"]
+    requested, done = audit_records(audit_path)
+    assert requested["params"] == {"target_host": "kvm02.example.test"}
+    assert done["outcome"] == "done" and done["status"] == "up"
+
+
+def test_migrate_without_target_lets_the_engine_choose(operator, engine):
+    by_name(engine, VM_UP)
+    two_hosts(engine)
+    migrate = engine.post(f"/api/vms/{VM_ID}/migrate").respond(200, json={})
+    vm_states(engine, ("migrating", "h1"), ("up", "h2"))
+    result = actions.migrate_vm("vm-test")
+    assert result["result"] == "done"
+    assert json.loads(migrate.calls.last.request.content) == {}
+
+
+def test_migration_that_returns_to_the_source_is_a_failure(operator, engine, audit_path):
+    by_name(engine, VM_UP)
+    two_hosts(engine)
+    engine.post(f"/api/vms/{VM_ID}/migrate").respond(200, json={})
+    vm_states(engine, ("migrating", "h1"), ("up", "h1"))
+    result = actions.migrate_vm("vm-test", target_host="h2")
+    assert result["result"] == "failed" and result["host"] == "kvm01.example.test"
+    assert "still on its original host" in result["message"]
+    assert audit_records(audit_path)[-1]["outcome"] == "failed"
+
+
+def test_migration_not_finished_in_time_is_pending(operator, engine):
+    by_name(engine, VM_UP)
+    two_hosts(engine)
+    engine.post(f"/api/vms/{VM_ID}/migrate").respond(200, json={})
+    vm_states(engine, ("migrating", "h1"))
+    result = actions.migrate_vm("vm-test", target_host="h2", timeout_seconds=0)
+    assert result["result"] == "pending" and result["status"] == "migrating"
+
+
+def test_migrate_to_current_host_is_no_change(operator, engine):
+    by_name(engine, VM_UP)
+    two_hosts(engine)
+    migrate = engine.post(f"/api/vms/{VM_ID}/migrate")
+    result = actions.migrate_vm("vm-test", target_host="kvm01.example.test")
+    assert result["result"] == "no_change" and not migrate.called
+
+
+@pytest.mark.parametrize("host, message", [
+    ("kvm99", "No host matches"),
+    ("h3", "not in the VM's cluster"),
+    ("h4", "must be up"),
+])
+def test_migrate_rejects_unusable_targets(operator, engine, host, message):
+    by_name(engine, VM_UP)
+    two_hosts(engine, H1, H2, {**H2, "id": "h3", "name": "other", "address": "x",
+                               "cluster": {"id": "c9"}},
+              {**H2, "id": "h4", "name": "sleepy", "address": "y", "status": "maintenance"})
+    with pytest.raises(ToolError, match=message):
+        actions.migrate_vm("vm-test", target_host=host)
+
+
+def test_migrate_needs_a_running_vm(operator, engine):
+    by_name(engine, VM_DOWN)
+    with pytest.raises(ToolError, match="Only running VMs"):
+        actions.migrate_vm("vm-2")
+
+
+def test_migrate_needs_another_host_when_engine_chooses(operator, engine):
+    by_name(engine, VM_UP)
+    two_hosts(engine, H1, {**H2, "status": "maintenance"})
+    with pytest.raises(ToolError, match="nowhere to go"):
+        actions.migrate_vm("vm-test")
+
+
+def test_migrate_dry_run_warns_when_target_lacks_memory(operator, engine):
+    by_name(engine, VM_UP)
+    two_hosts(engine, H1, {**H2, "max_scheduling_memory": str(1024**3)})
+    result = actions.migrate_vm("vm-test", target_host="h2", dry_run=True)
+    assert "probably refuse" in result["warnings"][0]
