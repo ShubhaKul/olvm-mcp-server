@@ -225,9 +225,9 @@ def test_main_registers_write_tools_only_in_operator_mode(monkeypatch, mode, exp
 
 # -- migrate_vm -------------------------------------------------------------
 
-H1 = {"id": "h1", "name": "kvm01.example.test", "address": "10.0.0.141", "status": "up",
+H1 = {"id": "h1", "name": "kvm01.example.test", "address": "192.0.2.11", "status": "up",
       "cluster": {"id": "c1"}, "max_scheduling_memory": str(12 * 1024**3)}
-H2 = {"id": "h2", "name": "kvm02.example.test", "address": "10.0.0.149", "status": "up",
+H2 = {"id": "h2", "name": "kvm02.example.test", "address": "192.0.2.12", "status": "up",
       "cluster": {"id": "c1"}, "max_scheduling_memory": str(12 * 1024**3)}
 
 
@@ -245,7 +245,7 @@ def test_migrate_dry_run_names_both_hosts(operator, engine, audit_path):
     by_name(engine, VM_UP)
     two_hosts(engine)
     migrate = engine.post(f"/api/vms/{VM_ID}/migrate")
-    result = actions.migrate_vm("vm-test", target_host="10.0.0.149", dry_run=True)
+    result = actions.migrate_vm("vm-test", target_host="192.0.2.12", dry_run=True)
     assert result["result"] == "would_run"
     assert result["from_host"] == "kvm01.example.test" and result["to_host"] == "kvm02.example.test"
     assert "keeps running" in result["message"] and "warnings" not in result
@@ -373,7 +373,7 @@ def test_maintenance_waits_until_host_is_in_maintenance(operator, engine, audit_
     vms_on(engine, VM_UP)
     deactivate = engine.post("/api/hosts/h1/deactivate").respond(200, json={"status": "complete"})
     host_states(engine, "h1", "preparing_for_maintenance", "maintenance")
-    result = actions.set_host_maintenance("10.0.0.141")
+    result = actions.set_host_maintenance("192.0.2.11")
     assert result["result"] == "done" and result["status"] == "maintenance"
     assert result["vms_on_host"] == ["vm-test"]
     assert deactivate.calls.last.request.headers["Correlation-Id"] == result["correlation_id"]
