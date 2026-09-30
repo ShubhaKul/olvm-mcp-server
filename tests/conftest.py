@@ -1,4 +1,3 @@
-import httpx
 import pytest
 import respx
 
@@ -7,14 +6,13 @@ from olvm_mcp.client import OlvmClient
 from olvm_mcp.config import Settings
 
 BASE = "https://engine.test/ovirt-engine"
-API = f"{BASE}/api"
 
 CLUSTERS = {"cluster": [{"id": "c1", "name": "Default"}]}
 HOSTS = {
     "host": [{
         "id": "h1",
         "name": "kvm01.example.test",
-        "address": "10.0.0.141",
+        "address": "192.0.2.11",
         "status": "up",
         "cluster": {"id": "c1", "href": "/ovirt-engine/api/clusters/c1"},
         "cpu": {"name": "AMD EPYC", "topology": {"sockets": "1", "cores": "2", "threads": "2"}},
@@ -73,6 +71,3 @@ def tool_client(client, monkeypatch):
     monkeypatch.setattr(server, "_client", client)
     return client
 
-
-def json_response(data, status=200):
-    return httpx.Response(status, json=data)

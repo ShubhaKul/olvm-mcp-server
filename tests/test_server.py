@@ -90,7 +90,7 @@ def test_get_vm_ambiguous_name(tool_client, engine):
 def test_list_hosts_summarizes(tool_client, engine):
     result = server.list_hosts()
     assert result["hosts"] == [{
-        "id": "h1", "name": "kvm01.example.test", "address": "10.0.0.141", "status": "up",
+        "id": "h1", "name": "kvm01.example.test", "address": "192.0.2.11", "status": "up",
         "cluster": "Default", "cpu_model": "AMD EPYC", "cpus": 4, "memory_gib": 16.0,
         "schedulable_memory_gib": 12.0, "vms_running": 1, "os": "OL 8.10",
         "vdsm_version": "vdsm-4.50.5", "spm": "spm",
