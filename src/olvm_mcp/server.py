@@ -41,7 +41,8 @@ mcp = MCPServer(
         "Use list_vms, list_hosts and list_storage_domains to find objects (they accept oVirt "
         "search syntax), then get_vm or list_snapshots for one VM. Use list_events to see what "
         "happened recently, and get_job_status to follow long-running engine operations. "
-        "In operator mode the server also offers start_vm, shutdown_vm and create_snapshot: "
+        "In operator mode the server also offers start_vm, shutdown_vm, create_snapshot and "
+        "migrate_vm: "
         "call them with dry_run=true first, show the user what would change, and only run the "
         "action after the user confirms."
     ),
