@@ -23,7 +23,7 @@ from mcp.types import ToolAnnotations
 from .client import OlvmClient, OlvmError, OlvmNotFound
 from .config import OPERATOR
 from .formatting import summarize_snapshot
-from .safety import AuditError, AuditLog, new_correlation_id
+from .safety import AuditError, AuditLog, ConfirmationError, ConfirmationTokens, new_correlation_id
 from .server import _resolve_vm, get_client
 
 POLL_INTERVAL_SECONDS = 3.0
@@ -42,6 +42,14 @@ MIGRATE = ToolAnnotations(read_only_hint=False, destructive_hint=False,
 # Maintenance deletes nothing, but it moves every VM off the host and takes it out of service.
 MAINTENANCE = ToolAnnotations(read_only_hint=False, destructive_hint=True,
                               idempotent_hint=True, open_world_hint=False)
+
+# Destructive actions: losing data or availability is possible, so they need a confirmation token.
+STOP = ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                       idempotent_hint=True, open_world_hint=False)
+RESTORE = ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                          idempotent_hint=False, open_world_hint=False)
+REMOVE = ToolAnnotations(read_only_hint=False, destructive_hint=True,
+                         idempotent_hint=True, open_world_hint=False)
 
 # Waits take (engine response) and return (result, extra fields for the tool output).
 Wait = Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]
@@ -551,10 +559,256 @@ def set_host_maintenance(host_name_or_id: str, maintenance: bool = True, dry_run
     return result
 
 
-def register(mcp: MCPServer) -> None:
-    """Add the write tools to the server. Called only in operator mode."""
+# -- destructive actions ----------------------------------------------------
+#
+# These have no dry_run argument. A call without confirm_token is the preview: it
+# changes nothing and returns a one-time token. Only a second call with that token,
+# the same arguments and an unchanged target runs the action.
+
+_tokens = ConfirmationTokens()
+
+
+def _destructive_target(action: str, vm_name_or_id: str) -> _Target:
+    target = _target(action, vm_name_or_id)
+    if not target.client.settings.allow_destructive:
+        raise ToolError("Destructive actions are disabled. Set OLVM_ALLOW_DESTRUCTIVE=true "
+                        "(with OLVM_MODE=operator) to enable them.")
+    return target
+
+
+def _confirmation(target: _Target, action: str, params: dict[str, Any], fingerprint: str,
+                  message: str, **extra: Any) -> dict[str, Any]:
+    token = _tokens.issue(action, target.id, params, fingerprint)
+    return {**target.describe(action), "result": "confirmation_required", "status": target.status,
+            **extra, "confirm_token": token, "expires_in_seconds": int(_tokens.ttl_seconds),
+            "message": (f"{message} Nothing has changed yet. Show this to the user, and only after "
+                        f"they confirm, call {action} again with the same arguments and "
+                        f"confirm_token={token}.")}
+
+
+def _redeem(target: _Target, action: str, params: dict[str, Any], fingerprint: str,
+            confirm_token: str) -> None:
+    try:
+        _tokens.redeem(confirm_token, action, target.id, params, fingerprint)
+    except ConfirmationError as e:
+        _audit_or_fail(target, **target.describe(action), outcome="denied", detail=str(e))
+        raise ToolError(f"{e}. Nothing was changed. Call {action} without confirm_token "
+                        f"for a new preview.") from e
+
+
+def stop_vm(vm_name_or_id: str, confirm_token: str = "", wait: bool = True,
+            timeout_seconds: int = 300) -> dict[str, Any]:
+    """Power off a virtual machine immediately, without a guest shutdown.
+
+    Like pulling the plug: unsaved data in the guest can be lost. Prefer
+    shutdown_vm unless the guest is hung. Needs OLVM_ALLOW_DESTRUCTIVE=true.
+
+    Call without confirm_token first: that only returns a preview and a one-time
+    token. Show the preview to the user and call again with confirm_token only
+    after they confirm. Every call that reaches the engine is audited.
+
+    Args:
+        vm_name_or_id: The VM's exact name, or its UUID.
+        confirm_token: The token from the preview. Leave empty to get a preview.
+        wait: Wait until the VM is down before returning.
+        timeout_seconds: How long to wait (0-900, default 300).
+    """
+    action = "stop_vm"
+    target = _destructive_target(action, vm_name_or_id)
+    if target.status == "down":
+        return _no_change(target, action, f"VM {target.name} is already down.", dry_run=not confirm_token)
+    fingerprint = f"status={target.status}"
+    if not confirm_token:
+        return _confirmation(target, action, {}, fingerprint, (
+            f"Would power off VM {target.name} (now {target.status}) in cluster {target.cluster} "
+            f"immediately. The guest OS gets no chance to shut down, so unsaved data can be lost; "
+            f"shutdown_vm is the safer choice unless the guest is hung."))
+    _redeem(target, action, {}, fingerprint, confirm_token)
+    return _execute(target, action, {},
+                    lambda cid: target.client.post(f"vms/{target.id}/stop", {}, cid),
+                    _wait_for_vm_status(target, "down", timeout_seconds) if wait else None)
+
+
+def _snapshots(target: _Target) -> list[dict[str, Any]]:
+    """The VM's real snapshots, oldest first (the 'active' one is the current state)."""
+    snaps = target.client.list(f"vms/{target.id}/snapshots", "snapshot")
+    snaps = [s for s in snaps if s.get("snapshot_type") != "active"]
+    return sorted(snaps, key=lambda s: int(s.get("date") or 0))
+
+
+def _find_snapshot(snaps: list[dict[str, Any]], wanted: str) -> dict[str, Any]:
+    wanted = wanted.strip()
+    matches = [s for s in snaps if s["id"] == wanted]
+    if not matches:
+        matches = [s for s in snaps if (s.get("description") or "").strip().lower() == wanted.lower()]
+    if not matches:
+        known = "; ".join(f"{s.get('description')!r} ({s['id']})" for s in snaps) or "none"
+        raise ToolError(f"No snapshot matches {wanted!r}. Snapshots: {known}. Use list_snapshots.")
+    if len(matches) > 1:
+        ids = ", ".join(s["id"] for s in matches)
+        raise ToolError(f"More than one snapshot is described as {wanted!r}; use one of these ids: {ids}")
+    return matches[0]
+
+
+def restore_snapshot(vm_name_or_id: str, snapshot: str, restore_memory: bool = False,
+                     confirm_token: str = "", wait: bool = True,
+                     timeout_seconds: int = 600) -> dict[str, Any]:
+    """Restore a stopped virtual machine to one of its snapshots.
+
+    The VM's disks go back to the snapshot: everything written since is lost,
+    and snapshots taken after it are deleted. The VM must be down. Needs
+    OLVM_ALLOW_DESTRUCTIVE=true.
+
+    Call without confirm_token first: that only returns a preview and a one-time
+    token. Show the preview to the user and call again with confirm_token only
+    after they confirm. Every call that reaches the engine is audited.
+
+    Args:
+        vm_name_or_id: The VM's exact name, or its UUID.
+        snapshot: The snapshot's id, or its exact description.
+        restore_memory: Also restore the saved memory, so the next start resumes
+            where the snapshot was taken. Only for snapshots that include memory.
+        confirm_token: The token from the preview. Leave empty to get a preview.
+        wait: Wait until the restore finishes before returning.
+        timeout_seconds: How long to wait (0-900, default 600).
+    """
+    action = "restore_snapshot"
+    target = _destructive_target(action, vm_name_or_id)
+    if target.status != "down":
+        raise ToolError(f"VM {target.name} is {target.status}; the engine only restores snapshots of "
+                        f"stopped VMs. Shut it down first (shutdown_vm).")
+    try:
+        snaps = _snapshots(target)
+    except OlvmError as e:
+        raise ToolError(str(e)) from e
+    snap = _find_snapshot(snaps, snapshot)
+    if snap.get("snapshot_status") != "ok":
+        raise ToolError(f"Snapshot {snap.get('description')!r} is {snap.get('snapshot_status')}; "
+                        f"only a snapshot with status ok can be restored.")
+    if restore_memory and str(snap.get("persist_memorystate")).lower() != "true":
+        raise ToolError(f"Snapshot {snap.get('description')!r} has no saved memory to restore.")
+
+    newer = snaps[snaps.index(snap) + 1:]
+    params = {"snapshot_id": snap["id"], "restore_memory": restore_memory}
+    fingerprint = f"status={target.status}; snapshots={','.join(s['id'] for s in snaps)}"
+    if not confirm_token:
+        lost = (f" These newer snapshots will be deleted: "
+                f"{', '.join(repr(s.get('description')) for s in newer)}." if newer else "")
+        return _confirmation(target, action, params, fingerprint, (
+            f"Would restore VM {target.name} in cluster {target.cluster} to snapshot "
+            f"{snap.get('description')!r} ({summarize_snapshot(snap).get('date')}). Its disks go back "
+            f"to that point and everything written since is lost.{lost}"),
+            snapshot=summarize_snapshot(snap),
+            snapshots_deleted=[summarize_snapshot(s) for s in newer])
+    _redeem(target, action, params, fingerprint, confirm_token)
+
+    def wait_for_restore(_response: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        def fetch() -> dict[str, Any]:
+            return {"vm": target.client.get(f"vms/{target.id}"),
+                    "snapshots": target.client.list(f"vms/{target.id}/snapshots", "snapshot")}
+
+        def settled(state: dict[str, Any]) -> bool:
+            busy = any(s.get("snapshot_status") in ("locked", "in_preview") for s in state["snapshots"])
+            return state["vm"].get("status") != "image_locked" and not busy
+
+        ready, state = _poll(fetch, settled, _clamp_wait(timeout_seconds))
+        status = state["vm"].get("status")
+        if ready and status == "down":
+            return "done", {"status": status}
+        if ready:
+            return "failed", {"status": status, "message": (
+                f"VM is {status} after the restore. list_events with the correlation id shows why.")}
+        return "pending", {"status": status, "message": (
+            f"The restore is still running after {_clamp_wait(timeout_seconds)} seconds. "
+            f"Check again with list_snapshots or get_vm.")}
+
+    body = {"restore_memory": restore_memory}
+    return _execute(target, action, params,
+                    lambda cid: target.client.post(f"vms/{target.id}/snapshots/{snap['id']}/restore",
+                                                   body, cid),
+                    wait_for_restore if wait else None)
+
+
+def remove_vm(vm_name_or_id: str, remove_disks: bool = True, confirm_token: str = "",
+              wait: bool = True, timeout_seconds: int = 300) -> dict[str, Any]:
+    """Permanently remove a stopped virtual machine. This can't be undone.
+
+    The VM must be down, and VMs with delete protection are refused (the server
+    never turns protection off). Needs OLVM_ALLOW_DESTRUCTIVE=true.
+
+    Call without confirm_token first: that only returns a preview and a one-time
+    token. Show the preview to the user and call again with confirm_token only
+    after they confirm. Every call that reaches the engine is audited.
+
+    Args:
+        vm_name_or_id: The VM's exact name, or its UUID.
+        remove_disks: Also delete the VM's disks (default). False keeps them as
+            unattached disks in their storage domain.
+        confirm_token: The token from the preview. Leave empty to get a preview.
+        wait: Wait until the VM is gone before returning.
+        timeout_seconds: How long to wait (0-900, default 300).
+    """
+    action = "remove_vm"
+    target = _destructive_target(action, vm_name_or_id)
+    if str(target.obj.get("delete_protected")).lower() == "true":
+        raise ToolError(f"VM {target.name} has delete protection turned on. Turn it off in the "
+                        f"Administration Portal first if it really should be removed.")
+    if target.status != "down":
+        raise ToolError(f"VM {target.name} is {target.status}; only a stopped VM can be removed. "
+                        f"Shut it down first (shutdown_vm).")
+    try:
+        attachments = target.client.get(f"vms/{target.id}/diskattachments",
+                                        {"follow": "disk"}).get("disk_attachment", [])
+    except OlvmError as e:
+        raise ToolError(str(e)) from e
+    disks = [a.get("disk") or {} for a in attachments]
+    params = {"remove_disks": remove_disks}
+    fingerprint = f"status={target.status}; disks={','.join(sorted(d.get('id', '') for d in disks))}"
+    if not confirm_token:
+        names = ", ".join(f"{d.get('alias') or d.get('name') or d.get('id')} "
+                          f"({_memory_gib(d.get('provisioned_size')):.0f} GiB)" for d in disks)
+        if not disks:
+            what = "It has no disks."
+        elif remove_disks:
+            what = f"Its {len(disks)} disk(s) are deleted too: {names}."
+        else:
+            what = f"Its {len(disks)} disk(s) are kept as unattached disks: {names}."
+        return _confirmation(target, action, params, fingerprint, (
+            f"Would permanently remove VM {target.name} from cluster {target.cluster}. {what} "
+            f"This can't be undone."), disks=[d.get("alias") or d.get("id") for d in disks])
+    _redeem(target, action, params, fingerprint, confirm_token)
+
+    def wait_for_removal(_response: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        def fetch() -> dict[str, Any]:
+            try:
+                return target.client.get(f"vms/{target.id}")
+            except OlvmNotFound:
+                return {"status": "removed"}
+
+        gone, vm = _poll(fetch, lambda v: v.get("status") == "removed", _clamp_wait(timeout_seconds))
+        if gone:
+            return "done", {"status": "removed"}
+        return "pending", {"status": vm.get("status"), "message": (
+            f"VM still exists after {_clamp_wait(timeout_seconds)} seconds (status "
+            f"{vm.get('status')}). Check again with get_vm, or list_events for the correlation id.")}
+
+    detach_only = "false" if remove_disks else "true"
+    return _execute(target, action, params,
+                    lambda cid: target.client.delete(f"vms/{target.id}", {"detach_only": detach_only}, cid),
+                    wait_for_removal if wait else None)
+
+
+def register(mcp: MCPServer, destructive: bool = False) -> None:
+    """Add the write tools to the server. Called only in operator mode.
+
+    The destructive tools are added only when OLVM_ALLOW_DESTRUCTIVE is also set.
+    """
     mcp.add_tool(start_vm, annotations=START)
     mcp.add_tool(shutdown_vm, annotations=SHUTDOWN)
     mcp.add_tool(create_snapshot, annotations=SNAPSHOT)
     mcp.add_tool(migrate_vm, annotations=MIGRATE)
     mcp.add_tool(set_host_maintenance, annotations=MAINTENANCE)
+    if destructive:
+        mcp.add_tool(stop_vm, annotations=STOP)
+        mcp.add_tool(restore_snapshot, annotations=RESTORE)
+        mcp.add_tool(remove_vm, annotations=REMOVE)

@@ -13,7 +13,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from .client import OlvmClient, OlvmError, OlvmNotFound
-from .config import OPERATOR, READ_ONLY, ConfigError, Settings, mode_from_env
+from .config import OPERATOR, READ_ONLY, ConfigError, Settings, destructive_from_env, mode_from_env
 from .formatting import (
     detail_vm,
     summarize_event,
@@ -44,7 +44,10 @@ mcp = MCPServer(
         "In operator mode the server also offers start_vm, shutdown_vm, create_snapshot, "
         "migrate_vm and set_host_maintenance: "
         "call them with dry_run=true first, show the user what would change, and only run the "
-        "action after the user confirms."
+        "action after the user confirms. If destructive actions are enabled, stop_vm, "
+        "restore_snapshot and remove_vm have no dry_run: the first call returns a preview and a "
+        "one-time confirm_token. Show the preview to the user, and pass the token in a second call "
+        "only after the user explicitly confirms. Never confirm on the user's behalf."
     ),
 )
 
@@ -267,10 +270,14 @@ def main() -> None:
     except ConfigError as e:
         log.error("%s; write tools stay disabled", e)
         mode = READ_ONLY
+    destructive = destructive_from_env()
     if mode == OPERATOR:
         from . import actions  # imports this module, so load it only when needed
-        actions.register(mcp)
-        log.info("Operator mode: write tools enabled")
+        actions.register(mcp, destructive=destructive)
+        log.info("Operator mode: write tools enabled%s",
+                 ", including destructive tools" if destructive else "")
+    elif destructive:
+        log.error("OLVM_ALLOW_DESTRUCTIVE needs OLVM_MODE=operator; destructive tools stay disabled")
     mcp.run()
 
 

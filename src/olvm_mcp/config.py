@@ -33,6 +33,12 @@ def mode_from_env(env: Mapping[str, str] | None = None) -> str:
     return mode
 
 
+def destructive_from_env(env: Mapping[str, str] | None = None) -> bool:
+    """Whether OLVM_ALLOW_DESTRUCTIVE turns on the destructive tools (operator mode only)."""
+    env = os.environ if env is None else env
+    return _truthy(env.get("OLVM_ALLOW_DESTRUCTIVE"))
+
+
 def _clusters(raw: str | None) -> tuple[str, ...]:
     return tuple(c.strip() for c in (raw or "").split(",") if c.strip())
 
@@ -68,6 +74,7 @@ class Settings:
     mode: str = READ_ONLY
     allowed_clusters: tuple[str, ...] = ()
     audit_log: Path = DEFAULT_AUDIT_LOG
+    allow_destructive: bool = False
 
     @property
     def verify(self) -> str | bool:
@@ -116,6 +123,9 @@ class Settings:
                 "OLVM_MODE=operator needs OLVM_ALLOWED_CLUSTERS: a comma-separated list of "
                 "cluster names that write actions may touch, or * for all clusters"
             )
+        allow_destructive = destructive_from_env(env)
+        if allow_destructive and mode != OPERATOR:
+            raise ConfigError("OLVM_ALLOW_DESTRUCTIVE=true needs OLVM_MODE=operator")
 
         return cls(
             url=_normalize_url(env["OLVM_URL"]),
@@ -127,4 +137,5 @@ class Settings:
             mode=mode,
             allowed_clusters=allowed_clusters,
             audit_log=Path(env["OLVM_AUDIT_LOG"]) if env.get("OLVM_AUDIT_LOG") else DEFAULT_AUDIT_LOG,
+            allow_destructive=allow_destructive,
         )
