@@ -103,6 +103,12 @@ class OlvmClient:
         headers = {"Correlation-Id": correlation_id} if correlation_id else None
         return self._request("POST", path, json=body, headers=headers)
 
+    def delete(self, path: str, params: dict[str, Any] | None = None,
+               correlation_id: str | None = None) -> dict[str, Any]:
+        """DELETE /api/<path> (remove an object) and return the response, if any."""
+        headers = {"Correlation-Id": correlation_id} if correlation_id else None
+        return self._request("DELETE", path, params=params, headers=headers)
+
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None,
                  json: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:
         url = f"/api/{path.lstrip('/')}"
@@ -128,7 +134,8 @@ class OlvmClient:
 
         if resp.status_code == 404:
             raise OlvmNotFound("Not found on the engine")
-        if resp.status_code >= 400 or not is_json:
+        # An empty success (e.g. after a DELETE) has no content type; that's fine.
+        if resp.status_code >= 400 or (resp.content and not is_json):
             detail = ""
             if is_json:
                 body = resp.json()

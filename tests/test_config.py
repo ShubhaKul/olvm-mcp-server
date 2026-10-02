@@ -75,3 +75,18 @@ def test_cluster_allow_list(tmp_path):
 def test_star_allows_every_cluster():
     s = Settings.from_env({**ENV, "OLVM_MODE": "operator", "OLVM_ALLOWED_CLUSTERS": "*"})
     assert s.cluster_allowed("anything")
+
+
+def test_destructive_is_off_by_default():
+    assert Settings.from_env({**ENV, "OLVM_MODE": "operator", "OLVM_ALLOWED_CLUSTERS": "*"}).allow_destructive is False
+
+
+def test_destructive_can_be_enabled_in_operator_mode():
+    s = Settings.from_env({**ENV, "OLVM_MODE": "operator", "OLVM_ALLOWED_CLUSTERS": "*",
+                           "OLVM_ALLOW_DESTRUCTIVE": "true"})
+    assert s.allow_destructive is True
+
+
+def test_destructive_needs_operator_mode():
+    with pytest.raises(ConfigError, match="needs OLVM_MODE=operator"):
+        Settings.from_env({**ENV, "OLVM_ALLOW_DESTRUCTIVE": "true"})

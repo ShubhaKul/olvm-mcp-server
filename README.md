@@ -22,7 +22,7 @@ Tested against OLVM 4.5.5. It is **read-only by default**. In [operator mode](#o
 
 Every tool above is marked read-only (`readOnlyHint`), and results are capped at 200 items.
 
-In operator mode, three write tools are added:
+In operator mode, five write tools are added:
 
 | Tool | What it does |
 |---|---|
@@ -31,6 +31,14 @@ In operator mode, three write tools are added:
 | `create_snapshot(vm_name_or_id, description, include_memory, dry_run, wait, timeout_seconds)` | Snapshots a VM's disks, optionally with memory, and waits until it is ready |
 | `migrate_vm(vm_name_or_id, target_host, dry_run, wait, timeout_seconds)` | Live-migrates a running VM to another host in its cluster (or one the engine picks) and waits until it runs there |
 | `set_host_maintenance(host_name_or_id, maintenance, dry_run, wait, timeout_seconds)` | Puts a host into maintenance (the engine live-migrates its VMs away) or activates it again; the dry run lists the VMs that would move |
+
+With `OLVM_ALLOW_DESTRUCTIVE=true` as well, three destructive tools are added. They need a [confirmation token](#destructive-actions):
+
+| Tool | What it does |
+|---|---|
+| `stop_vm(vm_name_or_id, confirm_token, wait, timeout_seconds)` | Powers a VM off immediately, without a guest shutdown |
+| `restore_snapshot(vm_name_or_id, snapshot, restore_memory, confirm_token, wait, timeout_seconds)` | Restores a stopped VM to a snapshot; snapshots taken after it are deleted |
+| `remove_vm(vm_name_or_id, remove_disks, confirm_token, wait, timeout_seconds)` | Permanently removes a stopped VM, with or without its disks; refuses delete-protected VMs |
 
 ## How it works
 
@@ -93,6 +101,7 @@ uv run python scripts/smoke_test.py vm-test
 | `OLVM_MODE` | no | `read_only` (default) or `operator`, which adds the write tools |
 | `OLVM_ALLOWED_CLUSTERS` | in operator mode | Comma-separated cluster names that write tools may touch, or `*` for all |
 | `OLVM_AUDIT_LOG` | no | Audit log file (default `~/.olvm-mcp/audit.jsonl`) |
+| `OLVM_ALLOW_DESTRUCTIVE` | no | `true` adds `stop_vm`, `restore_snapshot` and `remove_vm`. Needs `OLVM_MODE=operator` |
 
 See [.env.example](.env.example).
 
@@ -120,6 +129,19 @@ The audit log is JSON Lines, one object per line:
 Outcomes are `requested`, `done`, `pending`, `submitted`, `failed` and `denied`.
 
 **Which account to use.** Operator mode needs an engine user that can start, stop and snapshot VMs. A user with a role scoped to the allowed clusters (for example UserVmManager) keeps the engine as a second line of defence. With an admin account, the allow-list and the audit log are the only limits, so keep `OLVM_ALLOWED_CLUSTERS` narrow and use a password file.
+
+### Destructive actions
+
+`stop_vm`, `restore_snapshot` and `remove_vm` can lose data or can't be undone, so they need a second opt-in (`OLVM_ALLOW_DESTRUCTIVE=true`) and work in two steps instead of offering `dry_run`:
+
+1. **Preview.** A call without `confirm_token` changes nothing. It returns what would happen (for a restore, which newer snapshots would be deleted; for a removal, which disks) and a one-time `confirm_token`.
+2. **Confirm.** Only a second call with that token runs the action, after the assistant has shown you the preview and you have agreed.
+
+The server enforces the token. It works **once**, for **5 minutes**, only for the **same VM and arguments**, and only while the VM is **unchanged** since the preview (status, disks or snapshots). Anything else is refused and audited as `denied`, and the assistant has to ask for a new preview. Previews themselves aren't audited, because they change nothing.
+
+Two more rules: snapshots are restored and VMs removed only while the VM is down, and VMs with delete protection are refused. The server never turns delete protection off.
+
+The token proves that a preview was produced, not that a person read it. The server instructions tell the assistant to ask you before confirming, and MCP clients ask for approval before tools marked destructive, so keep that approval prompt turned on for these tools.
 
 Run operator mode as a **separate** MCP server entry next to the read-only one, so you can turn write access on and off independently:
 
@@ -204,7 +226,7 @@ Logs go to stderr, because stdout carries the MCP protocol.
 
 ## Roadmap
 
-- **Phase 2:** operator actions with dry-run, confirmation and an audit log. Done so far: modes, cluster allow-list, audit log, `start_vm`, `shutdown_vm`, `create_snapshot`, `migrate_vm`, `set_host_maintenance`. Next: destructive actions (power off, remove, restore) behind confirmation tokens
+- **Phase 2 (done):** operator actions with dry run, confirmation tokens and an audit log: modes, cluster allow-list, `start_vm`, `shutdown_vm`, `create_snapshot`, `migrate_vm`, `set_host_maintenance`, and the destructive `stop_vm`, `restore_snapshot` and `remove_vm`
 - **Phase 3:** Streamable HTTP transport with authentication, for remote clients
 - **Phase 4:** agents built on top (triage, capacity reports, provisioning)
 

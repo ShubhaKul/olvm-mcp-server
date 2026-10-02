@@ -8,28 +8,11 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from olvm_mcp import actions, server
-from olvm_mcp.client import OlvmClient
 
 from .conftest import VM_DOWN, VM_UP
 
 VM_ID = VM_UP["id"]
 SNAP_ID = "s-new"
-
-
-@pytest.fixture
-def audit_path(tmp_path):
-    return tmp_path / "audit" / "audit.jsonl"
-
-
-@pytest.fixture
-def operator(settings, engine, audit_path, monkeypatch):
-    """Tools pointed at the mocked engine, in operator mode for cluster Default."""
-    s = replace(settings, mode="operator", allowed_clusters=("Default",), audit_log=audit_path)
-    c = OlvmClient(s)
-    monkeypatch.setattr(server, "_client", c)
-    monkeypatch.setattr(actions, "POLL_INTERVAL_SECONDS", 0)
-    yield c
-    c.close()
 
 
 def audit_records(path):

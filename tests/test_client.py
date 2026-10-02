@@ -117,3 +117,11 @@ def test_names_are_cached(client, engine):
     assert client.names("clusters", "cluster") == {"c1": "Default"}
     client.names("clusters", "cluster")
     assert route.call_count == 1
+
+
+def test_delete_sends_params_and_correlation_id(client, engine):
+    route = engine.delete("/api/vms/x").respond(200)
+    assert client.delete("vms/x", {"detach_only": "false"}, "cid-1") == {}
+    request = route.calls.last.request
+    assert request.url.params["detach_only"] == "false"
+    assert request.headers["Correlation-Id"] == "cid-1"

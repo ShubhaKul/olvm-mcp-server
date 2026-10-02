@@ -1,7 +1,9 @@
+from dataclasses import replace
+
 import pytest
 import respx
 
-from olvm_mcp import server
+from olvm_mcp import actions, server
 from olvm_mcp.client import OlvmClient
 from olvm_mcp.config import Settings
 
@@ -71,3 +73,18 @@ def tool_client(client, monkeypatch):
     monkeypatch.setattr(server, "_client", client)
     return client
 
+
+@pytest.fixture
+def audit_path(tmp_path):
+    return tmp_path / "audit" / "audit.jsonl"
+
+
+@pytest.fixture
+def operator(settings, engine, audit_path, monkeypatch):
+    """Tools pointed at the mocked engine, in operator mode for cluster Default."""
+    s = replace(settings, mode="operator", allowed_clusters=("Default",), audit_log=audit_path)
+    c = OlvmClient(s)
+    monkeypatch.setattr(server, "_client", c)
+    monkeypatch.setattr(actions, "POLL_INTERVAL_SECONDS", 0)
+    yield c
+    c.close()
