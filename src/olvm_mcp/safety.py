@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import secrets
 import time
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from mcp.server.auth.middleware.auth_context import get_access_token
 
 CONFIRM_TTL_SECONDS = 300
 
@@ -24,8 +27,28 @@ def new_correlation_id() -> str:
     return f"olvm-mcp-{uuid.uuid4().hex[:12]}"
 
 
+def current_client() -> str:
+    """Who is behind the current request, for the audit log.
+
+    Over HTTP, the authenticated client: the name of its bearer token (later, the
+    OAuth subject). Over stdio there is no authentication, so it is the operating
+    system user running the server, as "local:<user>".
+    """
+    token = get_access_token()
+    if token is not None:
+        return token.subject or token.client_id
+    try:
+        return f"local:{getpass.getuser()}"
+    except Exception:  # no user name available, e.g. an unnamed uid in a container
+        return "local"
+
+
 class AuditLog:
-    """Append-only JSON Lines file: one record per write request and one per outcome."""
+    """Append-only JSON Lines file: one record per write request and one per outcome.
+
+    "user" is the engine account the server acts as; "client" is who asked
+    (see current_client), so actions through a shared account stay attributable.
+    """
 
     def __init__(self, path: Path, user: str):
         self._path = path
@@ -36,7 +59,8 @@ class AuditLog:
         return self._path
 
     def record(self, **fields: Any) -> None:
-        entry = {"time": datetime.now(tz=UTC).isoformat(timespec="seconds"), "user": self._user, **fields}
+        entry = {"time": datetime.now(tz=UTC).isoformat(timespec="seconds"), "user": self._user,
+                 "client": current_client(), **fields}
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             with self._path.open("a", encoding="utf-8") as f:
