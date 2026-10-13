@@ -1,0 +1,35 @@
+# olvm-mcp behind Caddy, which terminates TLS on port 443.
+# Only Caddy is published; the MCP server is reachable only from Caddy.
+# Usage and the files expected in /etc/olvm-mcp: see README.md in this folder.
+
+services:
+  olvm-mcp:
+    build: ..
+    image: olvm-mcp:local
+    restart: unless-stopped
+    env_file: /etc/olvm-mcp/olvm-mcp.env
+    volumes:
+      # Engine CA, engine password file and tokens file. ":z" relabels for SELinux.
+      - /etc/olvm-mcp:/etc/olvm-mcp:ro,z
+      - olvm-audit:/var/lib/olvm-mcp
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - olvm-mcp
+    ports:
+      - "443:443"
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST in deploy/.env to the address clients use}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro,z
+      - caddy-data:/data      # Caddy's private CA and certificates
+      - caddy-config:/config
+
+volumes:
+  olvm-audit:
+  caddy-data:
+  caddy-config:

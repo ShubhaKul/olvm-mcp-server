@@ -232,7 +232,7 @@ OLVM_AUTH_TOKENS_FILE=/etc/olvm-mcp/tokens
 OLVM_PUBLIC_URL=https://mcp.example.com     # what clients use
 ```
 
-It listens on `127.0.0.1:8000` by default. Put a TLS proxy (Caddy, nginx) in front of it, and don't expose the plain-HTTP port. The server checks the `Host` header against `OLVM_PUBLIC_URL` to block DNS-rebinding attacks.
+It listens on `127.0.0.1:8000` by default. Put a TLS proxy (Caddy, nginx) in front of it, and don't expose the plain-HTTP port. **[deploy/](deploy/README.md) has a ready-made Docker setup**: the server plus Caddy, with TLS from Caddy's private CA or Let's Encrypt. The server checks the `Host` header against `OLVM_PUBLIC_URL` to block DNS-rebinding attacks.
 
 **3. Connect a client** with the URL `https://mcp.example.com/mcp` and the header `Authorization: Bearer <token>`:
 
@@ -275,6 +275,7 @@ src/olvm_mcp/
   actions.py     write tools, registered only in operator mode
   remote.py      HTTP transport settings, bearer tokens, olvm-mcp-token
 tests/           unit tests against a mocked engine (respx)
+deploy/          Docker Compose deployment with Caddy (TLS)
 scripts/         smoke test against a real engine
 ```
 
@@ -283,7 +284,7 @@ Logs go to stderr, because stdout carries the MCP protocol.
 ## Roadmap
 
 - **Phase 2 (done):** operator actions with dry run, confirmation tokens and an audit log: modes, cluster allow-list, `start_vm`, `shutdown_vm`, `create_snapshot`, `migrate_vm`, `set_host_maintenance`, and the destructive `stop_vm`, `restore_snapshot` and `remove_vm`
-- **Phase 3 (in progress):** remote access. Done: Streamable HTTP with bearer-token authentication. Next: Docker image and deployment, per-user audit records, OAuth via Keycloak (ChatGPT and claude.ai connectors), MCP elicitation for destructive actions
+- **Phase 3 (in progress):** remote access. Done: Streamable HTTP with bearer-token authentication, Docker image and deployment. Next: per-user audit records, OAuth via Keycloak (ChatGPT and claude.ai connectors), MCP elicitation for destructive actions
 - **Phase 4:** agents built on top (triage, capacity reports, provisioning)
 
 ## License
