@@ -38,14 +38,16 @@ jobs:
           echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
           sudo mkdir -p /etc/olvm-mcp
           printf 'ci sha256:%s\n' "$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)" | sudo tee /etc/olvm-mcp/tokens >/dev/null
+          echo "unused" | sudo tee /etc/olvm-mcp/engine.pw >/dev/null
           printf '%s\n' \
             "OLVM_URL=https://engine.invalid/ovirt-engine" \
             "OLVM_USERNAME=ci@internal" \
-            "OLVM_PASSWORD=unused" \
+            "OLVM_PASSWORD_FILE=/etc/olvm-mcp/engine.pw" \
             "OLVM_AUTH_TOKENS_FILE=/etc/olvm-mcp/tokens" \
             "OLVM_PUBLIC_URL=https://127.0.0.1" | sudo tee /etc/olvm-mcp/olvm-mcp.env >/dev/null
+          # Same permissions as deploy/README.md: secrets 0640, the env file (no secrets) 0644.
           sudo chown -R root:10001 /etc/olvm-mcp
-          sudo sh -c 'chmod 750 /etc/olvm-mcp && chmod 640 /etc/olvm-mcp/*'
+          sudo sh -c 'chmod 755 /etc/olvm-mcp && chmod 640 /etc/olvm-mcp/* && chmod 644 /etc/olvm-mcp/olvm-mcp.env'
           echo "PUBLIC_HOST=127.0.0.1" > deploy/.env
 
       - name: Build and start
