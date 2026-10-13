@@ -127,11 +127,15 @@ Asking to start a VM that is already up, or to shut down one that is already dow
 The audit log is JSON Lines, one object per line:
 
 ```json
-{"time": "2026-09-30T10:15:02+00:00", "user": "admin@ovirt@internalsso", "action": "start_vm", "vm": "vm-test", "vm_id": "668ea110-…", "cluster": "Default", "correlation_id": "olvm-mcp-3f2a9c1b7d4e", "params": {}, "outcome": "requested"}
-{"time": "2026-09-30T10:15:41+00:00", "user": "admin@ovirt@internalsso", "action": "start_vm", "vm": "vm-test", "vm_id": "668ea110-…", "cluster": "Default", "correlation_id": "olvm-mcp-3f2a9c1b7d4e", "outcome": "done", "status": "up"}
+{"time": "2026-10-13T10:15:02+00:00", "user": "mcp-operator@internalsso", "client": "shubha-laptop", "action": "start_vm", "vm": "vm-test", "vm_id": "668ea110-…", "cluster": "Default", "correlation_id": "olvm-mcp-3f2a9c1b7d4e", "params": {}, "outcome": "requested"}
+{"time": "2026-10-13T10:15:41+00:00", "user": "mcp-operator@internalsso", "client": "shubha-laptop", "action": "start_vm", "vm": "vm-test", "vm_id": "668ea110-…", "cluster": "Default", "correlation_id": "olvm-mcp-3f2a9c1b7d4e", "outcome": "done", "status": "up"}
 ```
 
-Outcomes are `requested`, `done`, `pending`, `submitted`, `failed` and `denied`.
+- `user` is the **engine account** the server acts as. It's the same for every client of a server.
+- `client` is **who asked**. Over HTTP it's the name of the bearer token that authenticated the request (`olvm-mcp-token <name>`). Over stdio there is no authentication, so it's the operating-system user running the server, as `local:<user>`.
+- `correlation_id` also appears on the engine's own events. The engine records only the shared account, so joining the two by correlation id shows who really made each change.
+
+Outcomes are `requested`, `done`, `pending`, `submitted`, `failed` and `denied`. Refused attempts (`denied`) also carry `client`, although the engine never sees them.
 
 **Which account to use.** Operator mode needs an engine user that can start, stop and snapshot VMs. A user with a role scoped to the allowed clusters (for example UserVmManager) keeps the engine as a second line of defence. With an admin account, the allow-list and the audit log are the only limits, so keep `OLVM_ALLOWED_CLUSTERS` narrow and use a password file.
 
@@ -284,7 +288,7 @@ Logs go to stderr, because stdout carries the MCP protocol.
 ## Roadmap
 
 - **Phase 2 (done):** operator actions with dry run, confirmation tokens and an audit log: modes, cluster allow-list, `start_vm`, `shutdown_vm`, `create_snapshot`, `migrate_vm`, `set_host_maintenance`, and the destructive `stop_vm`, `restore_snapshot` and `remove_vm`
-- **Phase 3 (in progress):** remote access. Done: Streamable HTTP with bearer-token authentication, Docker image and deployment. Next: per-user audit records, OAuth via Keycloak (ChatGPT and claude.ai connectors), MCP elicitation for destructive actions
+- **Phase 3 (in progress):** remote access. Done: Streamable HTTP with bearer-token authentication, Docker image and deployment, per-user audit records (`client` field). Next: OAuth via Keycloak (ChatGPT and claude.ai connectors), MCP elicitation for destructive actions
 - **Phase 4:** agents built on top (triage, capacity reports, provisioning)
 
 ## License
