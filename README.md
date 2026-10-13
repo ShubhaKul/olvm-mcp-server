@@ -102,6 +102,11 @@ uv run python scripts/smoke_test.py vm-test
 | `OLVM_ALLOWED_CLUSTERS` | in operator mode | Comma-separated cluster names that write tools may touch, or `*` for all |
 | `OLVM_AUDIT_LOG` | no | Audit log file (default `~/.olvm-mcp/audit.jsonl`) |
 | `OLVM_ALLOW_DESTRUCTIVE` | no | `true` adds `stop_vm`, `restore_snapshot` and `remove_vm`. Needs `OLVM_MODE=operator` |
+| `OLVM_TRANSPORT` | no | `stdio` (default) or `http`. See [Remote access](#remote-access-http) |
+| `OLVM_AUTH_TOKENS_FILE` | for `http` | File of client names and token hashes. The server refuses to run over HTTP without it |
+| `OLVM_HTTP_HOST` / `OLVM_HTTP_PORT` | no | Address to listen on (default `127.0.0.1:8000`) |
+| `OLVM_PUBLIC_URL` | for `http` behind a proxy | The base URL clients use, e.g. `https://mcp.example.com`. Must be `https` unless it is localhost |
+| `OLVM_HTTP_ALLOWED_HOSTS` | no | Extra `Host` header values to accept, comma-separated |
 
 See [.env.example](.env.example).
 
@@ -199,6 +204,54 @@ Tunnel port 443 and map the engine's FQDN to `127.0.0.1` in your hosts file. The
 ssh -i <key> -L 443:localhost:443 opc@<engine-public-ip>
 ```
 
+## Remote access (HTTP)
+
+With `OLVM_TRANSPORT=http` the server runs as a long-lived service that clients reach over the network, using MCP's Streamable HTTP transport at `/mcp`. Every request needs a bearer token; the server refuses to start in HTTP mode without a tokens file.
+
+**1. Create a token for each client** (a person or an app). The token is printed once; the server keeps only its SHA-256 hash:
+
+```bash
+uv run olvm-mcp-token alice
+```
+
+```text
+Token for alice (give it to the client; it is shown only once):
+  q1Xb...
+
+Line for OLVM_AUTH_TOKENS_FILE:
+  alice sha256:5e88...
+```
+
+Put the `alice sha256:…` lines in the tokens file, one per client, and keep the file readable only by the service. To revoke a client, delete its line and restart the server.
+
+**2. Run the server** with the engine settings from [Configuration](#configuration) plus:
+
+```bash
+OLVM_TRANSPORT=http
+OLVM_AUTH_TOKENS_FILE=/etc/olvm-mcp/tokens
+OLVM_PUBLIC_URL=https://mcp.example.com     # what clients use
+```
+
+It listens on `127.0.0.1:8000` by default. Put a TLS proxy (Caddy, nginx) in front of it, and don't expose the plain-HTTP port. The server checks the `Host` header against `OLVM_PUBLIC_URL` to block DNS-rebinding attacks.
+
+**3. Connect a client** with the URL `https://mcp.example.com/mcp` and the header `Authorization: Bearer <token>`:
+
+```bash
+# Claude Code
+claude mcp add --transport http olvm https://mcp.example.com/mcp --header "Authorization: Bearer <token>"
+```
+
+```toml
+# Codex CLI: ~/.codex/config.toml (token read from an environment variable)
+[mcp_servers.olvm]
+url = "https://mcp.example.com/mcp"
+bearer_token_env_var = "OLVM_MCP_TOKEN"
+```
+
+ChatGPT and claude.ai custom connectors expect OAuth, which is planned (see the roadmap). Until then, use them with Claude Code, Codex or other clients that can send a header.
+
+**What the token does and doesn't control.** It decides who may use the server. What the server may do on the engine is still set by its engine account, `OLVM_MODE`, `OLVM_ALLOWED_CLUSTERS` and `OLVM_ALLOW_DESTRUCTIVE`, the same for every client of that server. Keep remote servers read-only or operator, and leave destructive actions off until confirmations can come from the user directly.
+
 ## Troubleshooting
 
 | Error | Cause |
@@ -207,6 +260,8 @@ ssh -i <key> -L 443:localhost:443 opc@<engine-public-ip>
 | `HTML error page ... no permissions` | The user has no role in OLVM. Assign ReadOnlyAdmin (system-wide) |
 | `CERTIFICATE_VERIFY_FAILED` | Set `OLVM_CA_FILE` to the engine's CA certificate |
 | `Cannot reach the engine` | Network, tunnel or hosts-file problem. Check `https://<fqdn>/ovirt-engine/services/health` in a browser |
+| HTTP 401 from `/mcp` | Missing or unknown bearer token. Check the client's `Authorization` header and the tokens file |
+| HTTP 421 or 403 from `/mcp` | The `Host` header doesn't match `OLVM_PUBLIC_URL`. Fix the URL, or add the host to `OLVM_HTTP_ALLOWED_HOSTS` |
 
 ## Development
 
@@ -218,6 +273,7 @@ src/olvm_mcp/
   server.py      MCP server and tools
   safety.py      audit log and correlation ids for write actions
   actions.py     write tools, registered only in operator mode
+  remote.py      HTTP transport settings, bearer tokens, olvm-mcp-token
 tests/           unit tests against a mocked engine (respx)
 scripts/         smoke test against a real engine
 ```
@@ -227,7 +283,7 @@ Logs go to stderr, because stdout carries the MCP protocol.
 ## Roadmap
 
 - **Phase 2 (done):** operator actions with dry run, confirmation tokens and an audit log: modes, cluster allow-list, `start_vm`, `shutdown_vm`, `create_snapshot`, `migrate_vm`, `set_host_maintenance`, and the destructive `stop_vm`, `restore_snapshot` and `remove_vm`
-- **Phase 3:** Streamable HTTP transport with authentication, for remote clients
+- **Phase 3 (in progress):** remote access. Done: Streamable HTTP with bearer-token authentication. Next: Docker image and deployment, per-user audit records, OAuth via Keycloak (ChatGPT and claude.ai connectors), MCP elicitation for destructive actions
 - **Phase 4:** agents built on top (triage, capacity reports, provisioning)
 
 ## License
