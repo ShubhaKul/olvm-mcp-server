@@ -1,4 +1,7 @@
-"""MCP server exposing read-only OLVM / oVirt tools over stdio."""
+"""MCP server for OLVM / oVirt: read-only tools, plus write tools in operator mode.
+
+Runs over stdio (the default) or Streamable HTTP with bearer-token auth (see remote.py).
+"""
 
 from __future__ import annotations
 
@@ -8,8 +11,10 @@ import re
 import sys
 from typing import Any
 
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from .client import OlvmClient, OlvmError, OlvmNotFound
@@ -23,6 +28,7 @@ from .formatting import (
     summarize_storage_domain,
     summarize_vm,
 )
+from .remote import HTTP, MCP_PATH, HttpSettings, StaticTokenVerifier, transport_from_env
 
 log = logging.getLogger("olvm_mcp")
 # httpx logs every request at INFO, which would echo engine URLs into client logs.
@@ -31,12 +37,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 MAX_RESULTS_LIMIT = 200
 _UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
-READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False,
-                            idempotent_hint=True, open_world_hint=False)
+READ_ONLY_TOOL = ToolAnnotations(read_only_hint=True, destructive_hint=False,
+                                 idempotent_hint=True, open_world_hint=False)
 
-mcp = MCPServer(
-    name="olvm",
-    instructions=(
+INSTRUCTIONS = (
         "Access to an Oracle Linux Virtualization Manager (OLVM) / oVirt engine. "
         "Use list_vms, list_hosts and list_storage_domains to find objects (they accept oVirt "
         "search syntax), then get_vm or list_snapshots for one VM. Use list_events to see what "
@@ -48,7 +52,6 @@ mcp = MCPServer(
         "restore_snapshot and remove_vm have no dry_run: the first call returns a preview and a "
         "one-time confirm_token. Show the preview to the user, and pass the token in a second call "
         "only after the user explicitly confirms. Never confirm on the user's behalf."
-    ),
 )
 
 _client: OlvmClient | None = None
@@ -77,7 +80,6 @@ def _list(collection: str, key: str, search: str, max_results: int) -> tuple[lis
     return items[:limit], len(items) > limit
 
 
-@mcp.tool(annotations=READ_ONLY)
 def list_vms(search: str = "", max_results: int = 50) -> dict[str, Any]:
     """List virtual machines with their status, cluster, host, CPUs and memory.
 
@@ -100,7 +102,6 @@ def list_vms(search: str = "", max_results: int = 50) -> dict[str, Any]:
     }
 
 
-@mcp.tool(annotations=READ_ONLY)
 def get_vm(name_or_id: str) -> dict[str, Any]:
     """Get details of one virtual machine, including its disks and network interfaces.
 
@@ -139,7 +140,6 @@ def _resolve_vm(client: OlvmClient, name_or_id: str) -> dict[str, Any]:
     return matches[0]
 
 
-@mcp.tool(annotations=READ_ONLY)
 def list_hosts(search: str = "", max_results: int = 50) -> dict[str, Any]:
     """List KVM hosts with their status, cluster, CPU, memory and running VM count.
 
@@ -160,7 +160,6 @@ def list_hosts(search: str = "", max_results: int = 50) -> dict[str, Any]:
     }
 
 
-@mcp.tool(annotations=READ_ONLY)
 def list_events(search: str = "", max_results: int = 50) -> dict[str, Any]:
     """List engine events (audit log entries), newest first.
 
@@ -183,7 +182,6 @@ def list_events(search: str = "", max_results: int = 50) -> dict[str, Any]:
     }
 
 
-@mcp.tool(annotations=READ_ONLY)
 def list_snapshots(vm_name_or_id: str) -> dict[str, Any]:
     """List the snapshots of one virtual machine.
 
@@ -205,7 +203,6 @@ def list_snapshots(vm_name_or_id: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool(annotations=READ_ONLY)
 def list_storage_domains(search: str = "", max_results: int = 50) -> dict[str, Any]:
     """List storage domains with their type, status, capacity and free space.
 
@@ -225,7 +222,6 @@ def list_storage_domains(search: str = "", max_results: int = 50) -> dict[str, A
     }
 
 
-@mcp.tool(annotations=READ_ONLY)
 def get_job_status(job_id: str = "", max_results: int = 20) -> dict[str, Any]:
     """Get the status of an engine job, or list recent jobs.
 
@@ -261,6 +257,29 @@ def get_job_status(job_id: str = "", max_results: int = 20) -> dict[str, Any]:
     }
 
 
+READ_TOOLS = (list_vms, get_vm, list_hosts, list_events, list_snapshots,
+              list_storage_domains, get_job_status)
+
+
+def create_server(http: HttpSettings | None = None) -> MCPServer:
+    """Build the server with the read tools. With HTTP settings, every request needs a bearer token."""
+    if http is None:
+        server = MCPServer(name="olvm", instructions=INSTRUCTIONS)
+    else:
+        server = MCPServer(
+            name="olvm", instructions=INSTRUCTIONS,
+            token_verifier=StaticTokenVerifier(http.token_hashes, resource=http.resource_url),
+            auth=AuthSettings(issuer_url=http.public_url, resource_server_url=http.resource_url,
+                              validate_token_resource=True),
+        )
+    for tool in READ_TOOLS:
+        server.add_tool(tool, annotations=READ_ONLY_TOOL)
+    return server
+
+
+mcp = create_server()
+
+
 def main() -> None:
     # stdout carries the MCP protocol; logs must go to stderr.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
@@ -271,14 +290,33 @@ def main() -> None:
         log.error("%s; write tools stay disabled", e)
         mode = READ_ONLY
     destructive = destructive_from_env()
+    try:
+        transport = transport_from_env()
+        http = HttpSettings.from_env() if transport == HTTP else None
+    except ConfigError as e:
+        # Unlike a bad mode, a bad remote setup must not fall back to something else.
+        log.error("%s", e)
+        sys.exit(2)
+
+    server = mcp if http is None else create_server(http)
     if mode == OPERATOR:
         from . import actions  # imports this module, so load it only when needed
-        actions.register(mcp, destructive=destructive)
+        actions.register(server, destructive=destructive)
         log.info("Operator mode: write tools enabled%s",
                  ", including destructive tools" if destructive else "")
     elif destructive:
         log.error("OLVM_ALLOW_DESTRUCTIVE needs OLVM_MODE=operator; destructive tools stay disabled")
-    mcp.run()
+
+    if http is None:
+        server.run()
+        return
+    log.info("Serving MCP over HTTP on %s:%s%s (public URL %s), %d client token(s)",
+             http.host, http.port, MCP_PATH, http.resource_url, len(http.token_hashes))
+    server.run("streamable-http", host=http.host, port=http.port, streamable_http_path=MCP_PATH,
+               transport_security=TransportSecuritySettings(
+                   enable_dns_rebinding_protection=True,
+                   allowed_hosts=list(http.allowed_hosts),
+                   allowed_origins=[http.public_url]))
 
 
 if __name__ == "__main__":
