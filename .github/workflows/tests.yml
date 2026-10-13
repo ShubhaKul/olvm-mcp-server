@@ -45,7 +45,7 @@ jobs:
             "OLVM_AUTH_TOKENS_FILE=/etc/olvm-mcp/tokens" \
             "OLVM_PUBLIC_URL=https://127.0.0.1" | sudo tee /etc/olvm-mcp/olvm-mcp.env >/dev/null
           sudo chown -R root:10001 /etc/olvm-mcp
-          sudo chmod 750 /etc/olvm-mcp && sudo chmod 640 /etc/olvm-mcp/*
+          sudo sh -c 'chmod 750 /etc/olvm-mcp && chmod 640 /etc/olvm-mcp/*'
           echo "PUBLIC_HOST=127.0.0.1" > deploy/.env
 
       - name: Build and start

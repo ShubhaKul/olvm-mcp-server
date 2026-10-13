@@ -77,7 +77,7 @@ The container runs as user id 10001, so give that group read access and nobody e
 
 ```bash
 sudo chown -R root:10001 /etc/olvm-mcp
-sudo chmod 750 /etc/olvm-mcp && sudo chmod 640 /etc/olvm-mcp/*
+sudo sh -c 'chmod 750 /etc/olvm-mcp && chmod 640 /etc/olvm-mcp/*'
 ```
 
 **Engine account:** use a dedicated account with a role scoped to the clusters in `OLVM_ALLOWED_CLUSTERS`, never `admin`. For remote use, keep `OLVM_ALLOW_DESTRUCTIVE` off.
