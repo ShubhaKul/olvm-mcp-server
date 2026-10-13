@@ -12,7 +12,9 @@ COPY src ./src
 RUN uv sync --locked --no-dev --no-editable
 
 FROM python:3.12-slim
-RUN useradd --system --uid 10001 --user-group --home-dir /var/lib/olvm-mcp --create-home olvm
+# Fixed ids: secrets on the host are shared with group 10001 (see deploy/README.md).
+RUN groupadd --system --gid 10001 olvm \
+ && useradd --system --uid 10001 --gid 10001 --home-dir /var/lib/olvm-mcp --create-home olvm
 COPY --from=build /app/.venv /app/.venv
 ENV PATH=/app/.venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
