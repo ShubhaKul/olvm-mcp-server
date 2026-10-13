@@ -1,0 +1,18 @@
+{
+	# Clients connecting by IP address send no TLS server name.
+	default_sni {$PUBLIC_HOST}
+	# There is no system trust store to update inside the container.
+	skip_install_trust
+}
+
+https://{$PUBLIC_HOST} {
+	# "tls internal": Caddy's own private CA issues the certificate. Clients must
+	# trust its root (see README.md). For a DNS name with a public certificate,
+	# remove this line and Caddy uses Let's Encrypt instead.
+	tls internal
+
+	reverse_proxy olvm-mcp:8000 {
+		# MCP streams responses (server-sent events); pass them through at once.
+		flush_interval -1
+	}
+}
