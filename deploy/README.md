@@ -73,12 +73,14 @@ docker run --rm --entrypoint olvm-mcp-token olvm-mcp:local alice
 sudo vi /etc/olvm-mcp/tokens
 ```
 
-The container runs as user id 10001, so give that group read access and nobody else:
+The container runs as user id 10001. The password and tokens files are readable only by root and that group. `olvm-mcp.env` holds no secrets, only settings and file paths, and must stay readable by you, because `docker compose` reads it as the user running it:
 
 ```bash
 sudo chown -R root:10001 /etc/olvm-mcp
-sudo sh -c 'chmod 750 /etc/olvm-mcp && chmod 640 /etc/olvm-mcp/*'
+sudo sh -c 'chmod 755 /etc/olvm-mcp && chmod 640 /etc/olvm-mcp/* && chmod 644 /etc/olvm-mcp/olvm-mcp.env'
 ```
+
+Never put a password in `olvm-mcp.env` (use `OLVM_PASSWORD_FILE`).
 
 **Engine account:** use a dedicated account with a role scoped to the clusters in `OLVM_ALLOWED_CLUSTERS`, never `admin`. For remote use, keep `OLVM_ALLOW_DESTRUCTIVE` off.
 
