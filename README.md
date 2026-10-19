@@ -308,6 +308,30 @@ By default it starts the server locally over stdio and forces **read-only mode**
 
 The footer of each report shows the model's token use and approximate cost; a run against a small lab costs a few cents. Requests use server-side fallbacks (`fallbacks: "default"`), so if a safety check wrongly declines one, it's finished by a fallback model and the report says so. If the analysis fails for any reason, the report is still written with the figures and a note.
 
+### Triage
+
+`olvm-triage` investigates a problem you describe and writes a root-cause report:
+
+1. **Collects** a baseline through the read tools: hosts, VMs, storage domains, recent jobs and the warnings and errors in the time window. For each VM or host you name with `--vm` / `--host`, also its details and all of its events. Routine events that repeat (hosts run update checks every day) are folded into one, with a count.
+2. **Asks Claude** to find the cause. It starts from your description and the baseline and follows leads with the read-only tools, up to `--max-tool-calls` (default 15). It can't change anything: write tools are never offered, and its next steps are suggestions for you.
+3. **Writes** `reports/triage-YYYY-MM-DD-HHMM.md`: summary, likely cause with a confidence level and the events it rests on, other possibilities, suggested next steps, then evidence tables built in code (objects involved, event timeline, jobs) to check the analysis against.
+
+```bash
+uv run olvm-triage "vm-test is down" --vm vm-test
+uv run olvm-triage "host kvm1 keeps going non-responsive" --host kvm1 --hours 72
+uv run olvm-triage "vm-test is down" --vm vm-test --no-llm    # evidence only: no API key, no cost
+```
+
+It takes the same engine settings, `--remote` options and model options as the capacity report, plus:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--vm` | | a VM involved (name or id); repeat for several |
+| `--host` | | a host involved (name, address or id); repeat for several |
+| `--hours` | 24 | how far back to look at events and jobs |
+
+Naming the objects isn't required, since Claude can look them up from your description, but it puts their events in the baseline and the evidence tables. A run against a small lab costs about $0.10.
+
 ## Development
 
 ```text
@@ -319,7 +343,7 @@ src/olvm_mcp/
   safety.py      audit log and correlation ids for write actions
   actions.py     write tools, registered only in operator mode
   remote.py      HTTP transport settings, bearer tokens, olvm-mcp-token
-  agents/        agents built on the server (capacity report)
+  agents/        agents built on the server (capacity report, triage)
 tests/           unit tests against a mocked engine (respx)
 deploy/          Docker Compose deployment with Caddy (TLS)
 scripts/         smoke test against a real engine
@@ -331,7 +355,7 @@ Logs go to stderr, because stdout carries the MCP protocol.
 
 - **Phase 2 (done):** operator actions with dry run, confirmation tokens and an audit log: modes, cluster allow-list, `start_vm`, `shutdown_vm`, `create_snapshot`, `migrate_vm`, `set_host_maintenance`, and the destructive `stop_vm`, `restore_snapshot` and `remove_vm`
 - **Phase 3 (in progress):** remote access. Done: Streamable HTTP with bearer-token authentication, Docker image and deployment, per-user audit records (`client` field). Next: OAuth via Keycloak (ChatGPT and claude.ai connectors), MCP elicitation for destructive actions
-- **Phase 4 (in progress):** agents built on top. Done: capacity report. Next: triage, provisioning
+- **Phase 4 (in progress):** agents built on top. Done: capacity report, triage. Next: provisioning
 
 ## License
 
