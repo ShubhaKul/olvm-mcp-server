@@ -18,6 +18,7 @@ dependencies = [
 olvm-mcp = "olvm_mcp.server:main"
 olvm-mcp-token = "olvm_mcp.remote:new_token_main"
 olvm-capacity-report = "olvm_mcp.agents.capacity:main"
+olvm-triage = "olvm_mcp.agents.triage:main"
 
 [project.optional-dependencies]
 agents = [
