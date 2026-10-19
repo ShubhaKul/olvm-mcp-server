@@ -54,12 +54,16 @@ jobs:
         working-directory: deploy
         run: docker compose up -d --build
 
-      - name: Wait for TLS on port 443
+      - name: Wait until the MCP server answers through Caddy
+        # Caddy is up first and answers 502 until olvm-mcp listens; a request
+        # without a token gets 401 only once the server itself is up.
         run: |
           for i in $(seq 1 60); do
-            curl -sk -o /dev/null https://127.0.0.1/mcp && exit 0
+            code=$(curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1/mcp || true)
+            [ "$code" = 401 ] && exit 0
             sleep 2
           done
+          echo "last status: $code"
           exit 1
 
       - name: Check the server over HTTPS, trusting only Caddy's root
