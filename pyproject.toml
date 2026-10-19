@@ -17,6 +17,12 @@ dependencies = [
 [project.scripts]
 olvm-mcp = "olvm_mcp.server:main"
 olvm-mcp-token = "olvm_mcp.remote:new_token_main"
+olvm-capacity-report = "olvm_mcp.agents.capacity:main"
+
+[project.optional-dependencies]
+agents = [
+    "anthropic>=1.15.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.24,<0.10.0"]

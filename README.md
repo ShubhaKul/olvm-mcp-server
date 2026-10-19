@@ -267,6 +267,47 @@ ChatGPT and claude.ai custom connectors expect OAuth, which is planned (see the 
 | HTTP 401 from `/mcp` | Missing or unknown bearer token. Check the client's `Authorization` header and the tokens file |
 | HTTP 421 or 403 from `/mcp` | The `Host` header doesn't match `OLVM_PUBLIC_URL`. Fix the URL, or add the host to `OLVM_HTTP_ALLOWED_HOSTS` |
 
+## Agents
+
+Agents are programs in which Claude works through a task on its own, using this server's tools. They connect to the server as an ordinary MCP client, so its modes, allow-lists and audit log apply to them too. They need the optional `agents` extra (the Anthropic SDK) and an [Anthropic API key](https://console.anthropic.com/):
+
+```bash
+uv sync --extra agents
+```
+
+### Capacity report
+
+`olvm-capacity-report` writes a dated Markdown report on how much room the environment has left:
+
+1. **Collects** hosts, VMs, storage domains and recent warning and error events through the read tools.
+2. **Computes** the figures in code: memory and vCPUs assigned per host and cluster, an **N+1 check** (could every host's running VMs restart on the others?), storage used and committed, plus rule-based findings. Every number in the report comes from this step, never from the model.
+3. **Asks Claude** for a summary, ranked risks and recommendations. Claude may call the read-only tools to look closer, up to `--max-tool-calls` (default 8). Write tools are never offered, and requests for them are refused.
+4. **Writes** `reports/capacity-YYYY-MM-DD-HHMM.md`: the analysis, then tables for findings, clusters, hosts, storage, VMs and events.
+
+```bash
+# PowerShell: engine settings for a read-only account, as for the smoke test
+$env:OLVM_URL = "https://<engine-fqdn>/ovirt-engine"
+$env:OLVM_USERNAME = "mcp-reader@ovirt@internalsso"
+$env:OLVM_PASSWORD_FILE = "C:\path\to\mcp-reader.pw"
+$env:OLVM_CA_FILE = "C:\path\to\olvm-ca.pem"
+$env:OLVM_AGENT_API_KEY_FILE = "C:\path\to\anthropic.key"   # or set ANTHROPIC_API_KEY
+
+uv run olvm-capacity-report             # full report
+uv run olvm-capacity-report --no-llm    # figures and findings only: no API key, no cost
+```
+
+By default it starts the server locally over stdio and forces **read-only mode**, whatever `OLVM_MODE` says. To use a remote server instead, add `--remote https://<host>/mcp --remote-token-file <file> --remote-ca-file <root.crt>`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--model` | `claude-opus-5-5` | Claude model; `claude-sonnet-5-5` costs about half |
+| `--effort` | `medium` | how hard the model thinks (`low` … `max`) |
+| `--max-tool-calls` | 8 | read-only tool calls the model may make |
+| `--event-days` | 7 | include warning and error events from this many days |
+| `--output-dir` | `reports` | where reports are written (ignored by Git) |
+
+The footer of each report shows the model's token use and approximate cost; a run against a small lab costs a few cents. Requests use server-side fallbacks (`fallbacks: "default"`), so if a safety check wrongly declines one, it's finished by a fallback model and the report says so. If the analysis fails for any reason, the report is still written with the figures and a note.
+
 ## Development
 
 ```text
@@ -278,6 +319,7 @@ src/olvm_mcp/
   safety.py      audit log and correlation ids for write actions
   actions.py     write tools, registered only in operator mode
   remote.py      HTTP transport settings, bearer tokens, olvm-mcp-token
+  agents/        agents built on the server (capacity report)
 tests/           unit tests against a mocked engine (respx)
 deploy/          Docker Compose deployment with Caddy (TLS)
 scripts/         smoke test against a real engine
@@ -289,7 +331,7 @@ Logs go to stderr, because stdout carries the MCP protocol.
 
 - **Phase 2 (done):** operator actions with dry run, confirmation tokens and an audit log: modes, cluster allow-list, `start_vm`, `shutdown_vm`, `create_snapshot`, `migrate_vm`, `set_host_maintenance`, and the destructive `stop_vm`, `restore_snapshot` and `remove_vm`
 - **Phase 3 (in progress):** remote access. Done: Streamable HTTP with bearer-token authentication, Docker image and deployment, per-user audit records (`client` field). Next: OAuth via Keycloak (ChatGPT and claude.ai connectors), MCP elicitation for destructive actions
-- **Phase 4:** agents built on top (triage, capacity reports, provisioning)
+- **Phase 4 (in progress):** agents built on top. Done: capacity report. Next: triage, provisioning
 
 ## License
 
